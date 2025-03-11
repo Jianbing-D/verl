@@ -61,10 +61,10 @@ def run_torch_entropy(hidden: torch.Tensor, weight: torch.Tensor, labels: torch.
 def run_verl_actor_entropy(hidden: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor) -> typing.List[torch.Tensor]:
     logits = torch.matmul(hidden.to(torch.float32), weight.to(torch.float32))  # [num_tokens, vocab_size]
     # compute entropy
-    entropy_rmpad = compute_entropy_from_logits(logits)  # ((total_nnz / sp) + pad)
+    entropy = compute_entropy_from_logits(logits)  # ((total_nnz / sp) + pad)
     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-    log_probs = logprobs_from_logits(logits=logits, labels=labels)
-    return log_probs, entropy_rmpad
+    logprobs = logprobs_from_logits(logits=logits, labels=labels)
+    return logprobs, entropy
 
 
 class TestLinearCrossEntropy:

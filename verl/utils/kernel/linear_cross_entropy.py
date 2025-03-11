@@ -47,6 +47,8 @@ class LinearCrossEntropy(torch.autograd.Function):
 
             logprobs, entropy, _maximum, _acc, _d_scale =\
                 kernels.efficient_entropy_foward(hidden, weight, labels, REDUCTION)
+            
+            logprobs = torch.neg(logprobs)
 
             ctx.save_for_backward(hidden, weight, labels, _maximum, _acc, _d_scale)
             ctx.REDUCTION = REDUCTION
