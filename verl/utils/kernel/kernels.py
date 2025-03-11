@@ -39,6 +39,7 @@ import triton
 import triton.language as tl
 
 
+
 @dataclass
 class EntropyReductionEnum:
     """
@@ -47,6 +48,7 @@ class EntropyReductionEnum:
     _None = 0
     _Sum = 1
     _Mean = 2
+
 
 
 def get_entropy_reduction_enum_number(reduction: str) -> int:
