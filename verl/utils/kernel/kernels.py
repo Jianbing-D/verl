@@ -668,6 +668,8 @@ def efficient_entropy_backward(dlogprobs: torch.Tensor,
     assert hidden.is_contiguous() and weight.is_contiguous() and labels.is_contiguous()
     assert hidden.shape[0] == labels.shape[0] and hidden.shape[1] == weight.shape[0]
 
+    dlogprobs = torch.neg(dlogprobs)
+
     num_tokens, hidden_size = hidden.shape
     num_tokens = labels.shape[0]
     hidden_size, vocab_size = weight.shape
