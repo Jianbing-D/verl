@@ -108,7 +108,7 @@ class TestLinearCrossEntropy:
         end_event = torch.cuda.Event(enable_timing=True)
 
         for i in range(iterations):
-            print(f"[INFO]: Iteration {i + 1} / {iterations}...", end="\r")
+            print(f"[INFO]: Iteration {i + 1} / {iterations}...")
             hidden, weight, labels = self.generate_forward_inputs()
 
             start_event.record()
@@ -130,7 +130,7 @@ class TestLinearCrossEntropy:
             kernel_forward_latency.append(start_event.elapsed_time(end_event))
 
             torch.testing.assert_close(torch_logprobs, verl_logprobs, atol=1e-4, rtol=1e-4)
-            torch.testing.assert_close(torch_logprobs, verl_entropy, atol=1e-4, rtol=1e-4)
+            torch.testing.assert_close(torch_entropy, verl_entropy, atol=1e-4, rtol=1e-4)
             torch.testing.assert_close(torch_logprobs, kernel_logprobs, atol=1e-4, rtol=1e-4)
             torch.testing.assert_close(torch_entropy, kernel_entropy, atol=1e-4, rtol=1e-4)
             torch.testing.assert_close(verl_logprobs, kernel_logprobs, atol=1e-4, rtol=1e-4)
@@ -237,6 +237,6 @@ if __name__ == "__main__":
 
     test = TestLinearCrossEntropy()
 
-    test.verify_correctness()
+    test.verify_correctness(1000)
     test.check_torch_storage()
     test.check_kernel_storage()
