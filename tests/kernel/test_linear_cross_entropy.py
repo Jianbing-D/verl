@@ -95,11 +95,9 @@ class TestLinearCrossEntropy:
         g_logprobs = (torch.empty((self.num_tokens,), dtype=self.dtype, device="cuda").uniform_(-1, 1))
         return g_entropy, g_logprobs
 
-    def verify_correctness(self):
+    def verify_correctness(self, iterations=5):
         self.cleanup()
         self.generate_hyper()
-
-        iterations = 5
 
         torch_forward_latency = list()
         torch_backward_latency = list()
