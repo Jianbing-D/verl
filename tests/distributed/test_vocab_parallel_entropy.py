@@ -1,3 +1,17 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 
 os.environ['NCCL_DEBUG'] = 'WARN'
@@ -12,9 +26,43 @@ from verl.utils.debug import log_gpu_memory_usage
 
 from megatron.core import mpu
 
+class Utils:
+    world_size = torch.cuda.device_count()
+    rank = int(os.environ.get('LOCAL_RANK', '0'))
+
+    @staticmethod
+    def initialize_distributed():
+        print(f'Initializing torch.distributed with rank: {Utils.rank}, world_size: {Utils.world_size}')
+        torch.cuda.set_device(Utils.rank % torch.cuda.device_count())
+        init_method = 'tcp://'
+        master_ip = os.getenv('MASTER_ADDR', 'localhost')
+        master_port = os.getenv('MASTER_PORT', '7000')
+        init_method += master_ip + ':' + master_port
+        torch.distributed.init_process_group(backend='nccl',
+                                             world_size=Utils.world_size,
+                                             rank=Utils.rank,
+                                             init_method=init_method)
+        print(f'successfully created process group')
+
+    @staticmethod
+    def destroy_model_parallel():
+        ps.destroy_model_parallel()
+        torch.distributed.barrier()
+
+    @staticmethod
+    def initialize_model_parallel(tensor_model_parallel_size=1,
+                                  pipeline_model_parallel_size=1,
+                                  virtual_pipeline_model_parallel_size=None,
+                                  pipeline_model_parallel_split_rank=None):
+        mpu.destroy_model_parallel()
+        if not torch.distributed.is_initialized():
+            Utils.initialize_distributed()
+        mpu.initialize_model_parallel(tensor_model_parallel_size, pipeline_model_parallel_size,
+                                     virtual_pipeline_model_parallel_size, pipeline_model_parallel_split_rank)
+
 def test_vocab_parallel_entropy():
     # check vocab_parallel_entropy
-    mpu.initialize_model_parallel(8, 1)
+    Utils.initialize_model_parallel(8, 1)
 
     batch_size = 2
     seqlen = 128
@@ -59,4 +107,8 @@ def test_vocab_parallel_entropy():
     if mpu.get_tensor_model_parallel_rank() == 0:
         print('test_vocab_parallel_entropy passes')
 
-    mpu.destroy_model_parallel()
+    Utils.destroy_model_parallel()
+
+
+if __name__ == '__main__':
+    test_vocab_parallel_entropy()
