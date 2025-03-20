@@ -53,3 +53,6 @@ jobs:
       - name: Testing LinearCrossEntropy Correction, Computation Time and Memory Consumption
         run: |
           python3 tests/kernel/test_linear_cross_entropy.py
+      - name: Testing VocabParallelEntropy
+        run: |
+          bash tests/kernel/run_vocab_parallel_entropy.sh

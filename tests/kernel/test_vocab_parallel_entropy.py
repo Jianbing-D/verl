@@ -46,8 +46,9 @@ class Utils:
 
     @staticmethod
     def destroy_model_parallel():
-        ps.destroy_model_parallel()
+        mpu.destroy_model_parallel()
         torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
 
     @staticmethod
     def initialize_model_parallel(tensor_model_parallel_size=1,
@@ -62,6 +63,7 @@ class Utils:
 
 def test_vocab_parallel_entropy():
     # check vocab_parallel_entropy
+    Utils.world_size = 8
     Utils.initialize_model_parallel(8, 1)
 
     batch_size = 2
