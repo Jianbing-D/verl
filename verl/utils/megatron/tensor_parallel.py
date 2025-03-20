@@ -105,7 +105,7 @@ class _VocabParallelEntropy(torch.autograd.Function):
         @torch.compile(dynamic=True)
         def mul_reduce(a, b):
             return (a * b).sum(dim=-1, keepdim=True)
-        
+
         logits_max = vocab_parallel_logits.max(dim=-1, keepdim=True).values
         dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=mpu.get_tensor_model_parallel_group())
         normalized_vocab_parallel_logits = vocab_parallel_logits - logits_max

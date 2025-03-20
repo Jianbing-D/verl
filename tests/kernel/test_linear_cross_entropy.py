@@ -47,7 +47,11 @@ from verl.utils.torch_functional import logprobs_from_logits
 
 compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
 
-def run_torch_entropy(hidden: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor, reduction="none") -> typing.List[torch.Tensor]:
+
+def run_torch_entropy(hidden: torch.Tensor,
+                      weight: torch.Tensor,
+                      labels: torch.Tensor,
+                      reduction="none") -> typing.List[torch.Tensor]:
     logits = torch.matmul(hidden.to(torch.float32), weight.to(torch.float32))  # [num_tokens, vocab_size]
     pd = torch.nn.functional.softmax(logits, dim=-1)  # [num_tokens, vocab_size]
     entropy_a = torch.logsumexp(logits, dim=-1)  # [num_tokens]
@@ -58,7 +62,10 @@ def run_torch_entropy(hidden: torch.Tensor, weight: torch.Tensor, labels: torch.
     return logprobs, entropy
 
 
-def run_verl_actor_entropy(hidden: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor, reduction="none") -> typing.List[torch.Tensor]:
+def run_verl_actor_entropy(hidden: torch.Tensor,
+                           weight: torch.Tensor,
+                           labels: torch.Tensor,
+                           reduction="none") -> typing.List[torch.Tensor]:
     logits = torch.matmul(hidden.to(torch.float32), weight.to(torch.float32))  # [num_tokens, vocab_size]
     # compute entropy
     entropy = compute_entropy_from_logits(logits)  # ((total_nnz / sp) + pad)
@@ -151,8 +158,8 @@ class TestLinearCrossEntropy:
 
             start_event.record()
             (d_verl_hidden, d_verl_weight) = torch.autograd.grad((verl_entropy, verl_logprobs), (hidden, weight),
-                                                                   (g_entropy, g_logprobs),
-                                                                   retain_graph=False)
+                                                                 (g_entropy, g_logprobs),
+                                                                 retain_graph=False)
             end_event.record()
             torch.cuda.synchronize()
             verl_backward_latency.append(start_event.elapsed_time(end_event))
@@ -194,7 +201,7 @@ class TestLinearCrossEntropy:
               f"{sum(kernel_forward_latency) / len(kernel_forward_latency):.2f} ms")
         print(f"[INFO]: Backward pass: kernel implementation average time: "
               f"{sum(kernel_backward_latency) / len(kernel_backward_latency):.2f} ms")
-    
+
     def check_storage(self, method_name, run_forward, reduction="none"):
         self.cleanup()
         self.generate_hyper()
@@ -216,7 +223,7 @@ class TestLinearCrossEntropy:
         torch.cuda.synchronize()
         torch_backward_max_memory = torch.cuda.max_memory_reserved() / 1024 / 1024
         print(f"[INFO]: {method_name} Backward pass peak memory: {torch_backward_max_memory:.2f} MB")
-    
+
     def check_storage_all(self):
         self.check_storage("Torch", run_torch_entropy)
         self.check_storage("VeRL", run_verl_actor_entropy)
