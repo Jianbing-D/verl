@@ -60,7 +60,7 @@ def run_torch_entropy(hidden: torch.Tensor,
     entropy = entropy_a - entropy_b
     logprobs = torch.nn.functional.cross_entropy(logits, labels, reduction=reduction)  # [num_tokens]
     logprobs = torch.neg(logprobs)
-    return logprobs, entropy, logits
+    return logprobs, entropy
 
 class TorchEntropyTP(torch.autograd.Function):
     """
@@ -381,7 +381,7 @@ class TestLinearCrossEntropy_TensorParallel:
             dist.all_gather(whole_weight_ref, weight, group=self.group)
             whole_weight.requires_grad_()
 
-            (single_logprobs, single_entropy, single_logits) = run_torch_entropy(hidden, whole_weight, labels)
+            (single_logprobs, single_entropy) = run_torch_entropy(hidden, whole_weight, labels)
 
             (tp_logprobs, tp_entropy) = run_torch_entropy_tp(hidden, weight, labels, self.group)
 
@@ -394,8 +394,8 @@ class TestLinearCrossEntropy_TensorParallel:
             dist.broadcast(g_entropy, src=0, group=self.group)
             dist.broadcast(g_logprobs, src=0, group=self.group)
 
-            (single_d_hidden, single_d_weight, single_d_logits) = torch.autograd.grad((single_entropy, single_logprobs),
-                                                                     (hidden, whole_weight, single_logits),
+            (single_d_hidden, single_d_weight) = torch.autograd.grad((single_entropy, single_logprobs),
+                                                                     (hidden, whole_weight),
                                                                      (g_entropy, g_logprobs),
                                                                      retain_graph=False)
                                                                      
@@ -425,7 +425,7 @@ if __name__ == "__main__":
     print(f"[INFO]: Running in {'distributed' if is_distributed else 'non-distributed'} mode")
     torch.manual_seed(233376 + int(os.environ.get("RANK", 0)))
 
-    # set_backward_method(BackwardEnum._Total_Fuse_MN)
+    set_backward_method(BackwardEnum._Total_Fuse_MN)
 
     if not is_distributed:
         test = TestLinearCrossEntropy()
