@@ -45,10 +45,10 @@ class LinearCrossEntropy(torch.autograd.Function):
         with torch.cuda.nvtx.range("LinearCrossEntropy-forward"):
             REDUCTION = kernels.get_entropy_reduction_enum_number(reduction.lower())
 
-            logprobs, entropy, _maximum, _acc, _d_scale =\
+            logprobs, entropy, _maximum, _acc, _entropy_b =\
                 kernels.efficient_entropy_foward(hidden, weight, labels, REDUCTION)
 
-            ctx.save_for_backward(hidden, weight, labels, _maximum, _acc, _d_scale)
+            ctx.save_for_backward(hidden, weight, labels, _maximum, _acc, _entropy_b)
             ctx.REDUCTION = REDUCTION
 
         return logprobs, entropy
@@ -56,11 +56,11 @@ class LinearCrossEntropy(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dlogprobs: torch.Tensor, dentropy: torch.Tensor) -> typing.List[torch.Tensor]:
         with torch.cuda.nvtx.range("LinearCrossEntropy-backward"):
-            (hidden, weight, labels, _maximum, _acc, _d_scale) = ctx.saved_tensors
+            (hidden, weight, labels, _maximum, _acc, _entropy_b) = ctx.saved_tensors
             REDUCTION = ctx.REDUCTION
 
             d_hidden, d_weight = kernels.efficient_entropy_backward(dlogprobs, dentropy, hidden, weight, labels,
-                                                                    _maximum, _acc, _d_scale, REDUCTION)
+                                                                    _maximum, _acc, _entropy_b, REDUCTION)
 
         return (d_hidden, d_weight, None, None)
 
