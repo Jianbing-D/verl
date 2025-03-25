@@ -296,7 +296,7 @@ class TestLinearCrossEntropy:
         torch.cuda.reset_peak_memory_stats()
         (logprobs, entropy) = run_forward(hidden, weight, labels, reduction)
         torch.cuda.synchronize()
-        torch_max_memory = torch.cuda.max_memory_reserved() / 1024 / 1024
+        torch_max_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
         print(f"[INFO]: {method_name} Forward pass peak memory: {torch_max_memory:.2f} MB")
 
         g_entropy, g_logprobs = self.generate_backward_inputs()
@@ -306,7 +306,7 @@ class TestLinearCrossEntropy:
                                                                (g_entropy, g_logprobs),
                                                                retain_graph=False)
         torch.cuda.synchronize()
-        torch_backward_max_memory = torch.cuda.max_memory_reserved() / 1024 / 1024
+        torch_backward_max_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
         print(f"[INFO]: {method_name} Backward pass peak memory: {torch_backward_max_memory:.2f} MB")
 
     def check_storage_all(self):
@@ -422,7 +422,7 @@ class TestLinearCrossEntropy_TensorParallel:
         torch.cuda.reset_peak_memory_stats()
         (tp_logprobs, tp_entropy) = run_torch_entropy_tp(hidden, weight, labels, self.group)
         torch.cuda.synchronize()
-        forward_max_memory = torch.cuda.max_memory_reserved() / 1024 / 1024
+        forward_max_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
 
         g_entropy, g_logprobs = self.generate_backward_inputs()
         # NOTE: we need to manually synchronize g_entropy and g_logprobs among Process Group
@@ -434,7 +434,7 @@ class TestLinearCrossEntropy_TensorParallel:
                                                          (g_entropy, g_logprobs),
                                                          retain_graph=False)
         torch.cuda.synchronize()
-        backward_max_memory = torch.cuda.max_memory_reserved() / 1024 / 1024
+        backward_max_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
         # NOTE: all-reduce on hidden is conducted outside the kernel
         dist.all_reduce(d_tp_hidden, op=dist.ReduceOp.SUM, group=self.group)
 
@@ -536,7 +536,7 @@ class TestLinearCrossEntropy_TensorParallel:
         torch.cuda.reset_peak_memory_stats()
         (kernel_logprobs, kernel_entropy) = linear_cross_entropy(hidden, weight, labels, "none", self.group)
         torch.cuda.synchronize()
-        kernel_max_memory = torch.cuda.max_memory_reserved() / 1024 / 1024
+        kernel_max_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
 
         g_entropy, g_logprobs = self.generate_backward_inputs()
         # NOTE: we need to manually synchronize g_entropy and g_logprobs among Process Group
@@ -548,7 +548,7 @@ class TestLinearCrossEntropy_TensorParallel:
                                                                  (g_entropy, g_logprobs),
                                                                  retain_graph=False)
         torch.cuda.synchronize()
-        kernel_backward_max_memory = torch.cuda.max_memory_reserved() / 1024 / 1024
+        kernel_backward_max_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
         # NOTE: all-reduce on hidden is conducted outside the kernel
         dist.all_reduce(d_kernel_hidden, op=dist.ReduceOp.SUM, group=self.group)
 
