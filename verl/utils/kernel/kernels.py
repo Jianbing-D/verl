@@ -445,8 +445,11 @@ def efficient_entropy_foward(hidden: torch.Tensor,
     assert logprobs.is_contiguous() and entropy.is_contiguous()
 
     maximum = torch.empty_like(entropy)
-    accumulate = torch.empty_like(entropy)
-    assert maximum.is_contiguous() and accumulate.is_contiguous()
+    accumulate_and_entropy_b = torch.empty((num_tokens * 2,), device=hidden.device, dtype=torch.float32)
+    accumulate_and_entropy_b_view = accumulate_and_entropy_b.view(2, num_tokens)
+    accumulate = accumulate_and_entropy_b_view[0,:]
+    entropy_b = accumulate_and_entropy_b_view[1,:]
+    assert maximum.is_contiguous() and accumulate.is_contiguous() and entropy_b.is_contiguous()
 
     vocab_per_split = 1024
     assert vocab_per_split % 128 == 0
@@ -455,15 +458,14 @@ def efficient_entropy_foward(hidden: torch.Tensor,
     _max = torch.empty((num_tokens, num_splits), device=hidden.device, dtype=torch.float32)
     _accu = torch.empty((num_tokens, num_splits), device=hidden.device, dtype=torch.float32)
     _entropy_b = torch.empty((num_tokens, num_splits), device=hidden.device, dtype=torch.float32)
-    entropy_b = torch.empty((num_tokens,), device=hidden.device, dtype=torch.float32)
 
     if REDUCTION == EntropyReductionEnum._None:
         _logprobs = logprobs
     else:
         _logprobs = torch.empty((num_tokens,), device=hidden.device, dtype=torch.float32)
 
-    assert _accu.is_contiguous() and _entropy_b.is_contiguous() and _max.is_contiguous() and entropy_b.is_contiguous()
-    assert _accu.is_cuda and _entropy_b.is_cuda and _max.is_cuda and entropy_b.is_cuda
+    assert _accu.is_contiguous() and _entropy_b.is_contiguous() and _max.is_contiguous()
+    assert _accu.is_cuda and _entropy_b.is_cuda and _max.is_cuda
 
     # 1D kernel launch, then split the tile
     def mainloop_grid(meta):
@@ -507,8 +509,7 @@ def efficient_entropy_foward(hidden: torch.Tensor,
             entropy_b, entropy_b.stride(0)
         )
 
-        dist.all_reduce(accumulate, op=dist.ReduceOp.SUM, group=dist_process_group)
-        dist.all_reduce(entropy_b, op=dist.ReduceOp.SUM, group=dist_process_group)
+        dist.all_reduce(accumulate_and_entropy_b, op=dist.ReduceOp.SUM, group=dist_process_group)
 
         # update logprobs & entropy
         efficient_entropy_triton_epilogue_tp_update[epilogue_grid](
