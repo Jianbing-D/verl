@@ -573,8 +573,7 @@ if __name__ == "__main__":
         test = TestLinearCrossEntropy()
 
         test.verify_correctness()
-        test.check_torch_storage()
-        test.check_kernel_storage()
+        test.check_storage_all()
     else:
         test = TestLinearCrossEntropy_TensorParallel()
 
