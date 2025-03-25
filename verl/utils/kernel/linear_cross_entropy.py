@@ -43,8 +43,7 @@ class LinearCrossEntropy(torch.autograd.Function):
                 weight: torch.Tensor,
                 labels: torch.Tensor,
                 reduction: typing.Optional[str] = "mean",
-                dist_process_group: typing.Optional[dist.ProcessGroup] = None
-    ) -> typing.List[torch.Tensor]:
+                dist_process_group: typing.Optional[dist.ProcessGroup] = None) -> typing.List[torch.Tensor]:
         with torch.cuda.nvtx.range("LinearCrossEntropy-forward"):
             REDUCTION = kernels.get_entropy_reduction_enum_number(reduction.lower())
 

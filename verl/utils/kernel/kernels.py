@@ -234,9 +234,8 @@ def efficient_entropy_triton_kernel_epilogue(max_ptr, stride_max_m, stride_max_n
                                              global_max_ptr, stride_global_max, accu_ptr, stride_accu_m, stride_accu_n,
                                              global_accu_ptr, stride_global_accu, entropy_b_ptr, stride_entropy_b_m,
                                              stride_entropy_b_n, global_entropy_b_ptr, stride_global_entropy_b,
-                                             global_entropy_ptr, stride_global_entropy,
-                                             global_logprobs_ptr, stride_global_logprobs, global_logprobs_scalar_ptr,
-                                             reduction: int,
+                                             global_entropy_ptr, stride_global_entropy, global_logprobs_ptr,
+                                             stride_global_logprobs, global_logprobs_scalar_ptr, reduction: int,
                                              BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
     """
     foward epilogue
@@ -277,8 +276,7 @@ def efficient_entropy_triton_kernel_epilogue(max_ptr, stride_max_m, stride_max_n
 
     # store entropy_b
     global_entropy_b = tl.fdiv(global_entropy_b, global_accu)  # entropy_b
-    tl.store(global_entropy_b_ptr + offs_m * stride_global_entropy_b,
-             global_entropy_b, mask=offs_m < num_tokens)
+    tl.store(global_entropy_b_ptr + offs_m * stride_global_entropy_b, global_entropy_b, mask=offs_m < num_tokens)
 
     # store entropy
     global_accu_ptrs = global_accu_ptr + offs_m * stride_global_accu
@@ -302,22 +300,13 @@ def efficient_entropy_triton_kernel_epilogue(max_ptr, stride_max_m, stride_max_n
         tl.atomic_add(global_logprobs_scalar_ptr, global_logprobs_scalar)
 
 
-@triton.autotune(
-    configs=[triton.Config({"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64})],
-    key=["num_tokens", "num_splits"]
-)
+@triton.autotune(configs=[triton.Config({"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64})], key=["num_tokens", "num_splits"])
 @triton.jit
-def efficient_entropy_triton_kernel_epilogue_tp(num_tokens,
-                                                num_splits,
-                                                reduced_max_ptr, stride_reduced_max_m, stride_reduced_max_n,
-                                                original_max_ptr, stride_original_max_m, stride_original_max_n,
-                                                accu_ptr, stride_accu_m, stride_accu_n,
-                                                entropy_b_ptr, stride_entropy_b_m, stride_entropy_b_n,
-                                                global_max_ptr, stride_global_max, 
-                                                global_accu_ptr, stride_global_accu,
-                                                global_entropy_b_ptr, stride_global_entropy_b,
-                                                BLOCK_SIZE_M: tl.constexpr,
-                                                BLOCK_SIZE_N: tl.constexpr):
+def efficient_entropy_triton_kernel_epilogue_tp(
+        num_tokens, num_splits, reduced_max_ptr, stride_reduced_max_m, stride_reduced_max_n, original_max_ptr,
+        stride_original_max_m, stride_original_max_n, accu_ptr, stride_accu_m, stride_accu_n, entropy_b_ptr,
+        stride_entropy_b_m, stride_entropy_b_n, global_max_ptr, stride_global_max, global_accu_ptr, stride_global_accu,
+        global_entropy_b_ptr, stride_global_entropy_b, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
     pid_m = tl.program_id(axis=0)
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -328,16 +317,18 @@ def efficient_entropy_triton_kernel_epilogue_tp(num_tokens,
     for pid_n in range(0, tl.cdiv(num_splits, BLOCK_SIZE_N)):
         offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
-        _reduced_max = tl.load(reduced_max_ptr + offs_m[:, None] * stride_reduced_max_m + offs_n[None, :] * stride_reduced_max_n,
+        _reduced_max = tl.load(reduced_max_ptr + offs_m[:, None] * stride_reduced_max_m +
+                               offs_n[None, :] * stride_reduced_max_n,
                                mask=(offs_m[:, None] < num_tokens) & (offs_n[None, :] < num_splits),
                                other=0.0)
-        _original_max = tl.load(original_max_ptr + offs_m[:, None] * stride_original_max_m + offs_n[None, :] * stride_original_max_n,
+        _original_max = tl.load(original_max_ptr + offs_m[:, None] * stride_original_max_m +
+                                offs_n[None, :] * stride_original_max_n,
                                 mask=(offs_m[:, None] < num_tokens) & (offs_n[None, :] < num_splits),
                                 other=0.0)
         _accu = tl.load(accu_ptr + offs_m[:, None] * stride_accu_m + offs_n[None, :] * stride_accu_n,
-                       mask=(offs_m[:, None] < num_tokens) & (offs_n[None, :] < num_splits),
-                       other=0.0)
-        
+                        mask=(offs_m[:, None] < num_tokens) & (offs_n[None, :] < num_splits),
+                        other=0.0)
+
         # local reduce-max
         _max_old = global_max
         _local_max = tl.max(_reduced_max, axis=1)
@@ -349,33 +340,23 @@ def efficient_entropy_triton_kernel_epilogue_tp(num_tokens,
         global_accu = _coeff * global_accu + tl.sum(_scale * _accu, axis=1)
 
         # update entropy_b
-        _entropy_b = tl.load(entropy_b_ptr + offs_m[:, None] * stride_entropy_b_m + offs_n[None, :] * stride_entropy_b_n,
+        _entropy_b = tl.load(entropy_b_ptr + offs_m[:, None] * stride_entropy_b_m +
+                             offs_n[None, :] * stride_entropy_b_n,
                              mask=(offs_m[:, None] < num_tokens) & (offs_n[None, :] < num_splits),
                              other=0.0)
         global_entropy_b = _coeff * global_entropy_b + tl.sum(_scale * _entropy_b, axis=1)
 
     # store
-    tl.store(global_max_ptr + offs_m * stride_global_max,
-             global_max, mask=offs_m < num_tokens)
-    tl.store(global_accu_ptr + offs_m * stride_global_accu,
-             global_accu, mask=offs_m < num_tokens)
-    tl.store(global_entropy_b_ptr + offs_m * stride_global_entropy_b,
-             global_entropy_b, mask=offs_m < num_tokens)
-        
-        
-@triton.autotune(
-    configs=[triton.Config({"BLOCK_SIZE_M": 16})],
-    key=["num_tokens"]
-)
+    tl.store(global_max_ptr + offs_m * stride_global_max, global_max, mask=offs_m < num_tokens)
+    tl.store(global_accu_ptr + offs_m * stride_global_accu, global_accu, mask=offs_m < num_tokens)
+    tl.store(global_entropy_b_ptr + offs_m * stride_global_entropy_b, global_entropy_b, mask=offs_m < num_tokens)
+
+
+@triton.autotune(configs=[triton.Config({"BLOCK_SIZE_M": 16})], key=["num_tokens"])
 @triton.jit
-def efficient_entropy_triton_epilogue_tp_update(num_tokens,
-                                                logprobs_ptr, stride_logprobs,
-                                                maximum_ptr, stride_maximum,
-                                                accumulate_ptr, stride_accumulate,
-                                                entropy_b_ptr, stride_entropy_b,
-                                                entropy_ptr, stride_entropy,
-                                                logprobs_scalar_ptr,
-                                                reduction: int,
+def efficient_entropy_triton_epilogue_tp_update(num_tokens, logprobs_ptr, stride_logprobs, maximum_ptr, stride_maximum,
+                                                accumulate_ptr, stride_accumulate, entropy_b_ptr, stride_entropy_b,
+                                                entropy_ptr, stride_entropy, logprobs_scalar_ptr, reduction: int,
                                                 BLOCK_SIZE_M: tl.constexpr):
     pid_m = tl.program_id(axis=0)
 
@@ -390,7 +371,7 @@ def efficient_entropy_triton_epilogue_tp_update(num_tokens,
 
     entropy = tl.log(accumulate) + maximum - entropy_b
     tl.store(entropy_ptr + offs_m * stride_entropy, entropy, mask=offs_m < num_tokens)
-    
+
     logprobs = tl.load(logprobs_ptr + offs_m * stride_logprobs, mask=offs_m < num_tokens)
     logprobs = maximum + tl.log(accumulate) - logprobs
 
@@ -407,12 +388,13 @@ def efficient_entropy_triton_epilogue_tp_update(num_tokens,
 
 _dedicated_stream, _dedicated_events = None, None
 
-def efficient_entropy_forward(hidden: torch.Tensor,
-                             weight: torch.Tensor,
-                             labels: torch.Tensor,
-                             reduction: typing.Optional[int] = 2,
-                             dist_process_group: typing.Optional[dist.ProcessGroup] = None
-    ) -> typing.List[torch.Tensor]:
+
+def efficient_entropy_forward(
+        hidden: torch.Tensor,
+        weight: torch.Tensor,
+        labels: torch.Tensor,
+        reduction: typing.Optional[int] = 2,
+        dist_process_group: typing.Optional[dist.ProcessGroup] = None) -> typing.List[torch.Tensor]:
     """
     forward host function
     """
@@ -455,8 +437,8 @@ def efficient_entropy_forward(hidden: torch.Tensor,
     maximum = torch.empty_like(entropy)
     accumulate_and_entropy_b = torch.empty((num_tokens * 2,), device=hidden.device, dtype=torch.float32)
     accumulate_and_entropy_b_view = accumulate_and_entropy_b.view(2, num_tokens)
-    accumulate = accumulate_and_entropy_b_view[0,:]
-    entropy_b = accumulate_and_entropy_b_view[1,:]
+    accumulate = accumulate_and_entropy_b_view[0, :]
+    entropy_b = accumulate_and_entropy_b_view[1, :]
     assert maximum.is_contiguous() and accumulate.is_contiguous() and entropy_b.is_contiguous()
 
     vocab_per_split = 1024
@@ -510,31 +492,22 @@ def efficient_entropy_forward(hidden: torch.Tensor,
             dist.all_reduce(_logprobs, op=dist.ReduceOp.SUM, group=dist_process_group)
             _dedicated_stream.record_event(_dedicated_events[1])
 
-        efficient_entropy_triton_kernel_epilogue_tp[epilogue_grid](
-            num_tokens, num_splits,
-            _max, _max.stride(0), _max.stride(1),
-            _max_backup, _max_backup.stride(0), _max_backup.stride(1),
-            _accu, _accu.stride(0), _accu.stride(1),
-            _entropy_b, _entropy_b.stride(0), _entropy_b.stride(1),
-            maximum, maximum.stride(0),
-            accumulate, accumulate.stride(0),
-            entropy_b, entropy_b.stride(0)
-        )
+        efficient_entropy_triton_kernel_epilogue_tp[epilogue_grid](num_tokens, num_splits, _max, _max.stride(0),
+                                                                   _max.stride(1), _max_backup, _max_backup.stride(0),
+                                                                   _max_backup.stride(1), _accu, _accu.stride(0),
+                                                                   _accu.stride(1), _entropy_b, _entropy_b.stride(0),
+                                                                   _entropy_b.stride(1), maximum, maximum.stride(0),
+                                                                   accumulate, accumulate.stride(0), entropy_b,
+                                                                   entropy_b.stride(0))
         torch.cuda.current_stream().wait_event(_dedicated_events[1])
 
         dist.all_reduce(accumulate_and_entropy_b, op=dist.ReduceOp.SUM, group=dist_process_group)
 
         # update logprobs & entropy
-        efficient_entropy_triton_epilogue_tp_update[epilogue_grid](
-            num_tokens,
-            _logprobs, _logprobs.stride(0),
-            maximum, maximum.stride(0),
-            accumulate, accumulate.stride(0),
-            entropy_b, entropy_b.stride(0),
-            entropy, entropy.stride(0),
-            logprobs,
-            REDUCTION
-        )
+        efficient_entropy_triton_epilogue_tp_update[epilogue_grid](num_tokens, _logprobs, _logprobs.stride(0), maximum,
+                                                                   maximum.stride(0), accumulate, accumulate.stride(0),
+                                                                   entropy_b, entropy_b.stride(0), entropy,
+                                                                   entropy.stride(0), logprobs, REDUCTION)
 
     return (logprobs, entropy, maximum, accumulate, entropy_b)
 
@@ -555,11 +528,12 @@ def efficient_entropy_forward(hidden: torch.Tensor,
 )
 @triton.jit
 def efficient_entropy_backward_kernel_general_mainloop_MN(
-        num_tokens: int, hidden_size: int, vocab_size: int, rank: int, hidden_ptr, stride_hidden_m, stride_hidden_k, weight_ptr,
-        stride_weight_k, stride_weight_n, labels_ptr, stride_labels, maximum_ptr, stride_maximum, accu_ptr, stride_accu,
-        d_entropy_ptr, stride_d_entropy, d_logprobs_ptr, stride_d_logprobs, reduction: int, entropy_b_ptr, stride_entropy_b,
-        d_hidden_ptr, stride_d_hidden_m, stride_d_hidden_k, d_weight_ptr, stride_d_weight_k, stride_d_weight_n,
-        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+        num_tokens: int, hidden_size: int, vocab_size: int, rank: int, hidden_ptr, stride_hidden_m, stride_hidden_k,
+        weight_ptr, stride_weight_k, stride_weight_n, labels_ptr, stride_labels, maximum_ptr, stride_maximum, accu_ptr,
+        stride_accu, d_entropy_ptr, stride_d_entropy, d_logprobs_ptr, stride_d_logprobs, reduction: int, entropy_b_ptr,
+        stride_entropy_b, d_hidden_ptr, stride_d_hidden_m, stride_d_hidden_k, d_weight_ptr, stride_d_weight_k,
+        stride_d_weight_n, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr):
     """
     backward mainloop, where d_logits & d_hidden & d_weight are fused
     """
@@ -632,8 +606,8 @@ def efficient_entropy_backward_kernel_general_mainloop_MN(
     exp_logits = tl.exp(logits - maximum[:, None])
 
     mask = (offs_bn + rank * vocab_size)[None, :] == labels[:, None]
-    d_logits = d_logprobs[:,None] * (exp_logits * accu_rcp[:,None] - mask)
-    d_logits += d_entropy[:,None] * (-exp_logits * accu_rcp[:,None]) * (logits - entropy_b[:,None])
+    d_logits = d_logprobs[:, None] * (exp_logits * accu_rcp[:, None] - mask)
+    d_logits += d_entropy[:, None] * (-exp_logits * accu_rcp[:, None]) * (logits - entropy_b[:, None])
 
     # loop for d_weight & d_hidden
     for k in range(0, tl.cdiv(hidden_size, BLOCK_SIZE_K)):
@@ -675,11 +649,11 @@ def efficient_entropy_backward_kernel_general_mainloop_MN(
 )
 @triton.jit
 def efficient_entropy_backward_kernel_general_d_logits(
-        num_tokens: int, hidden_size: int, vocab_size: int, rank: int, hidden_ptr, stride_hidden_m, stride_hidden_k, weight_ptr,
-        stride_weight_k, stride_weight_n, labels_ptr, stride_labels, maximum_ptr, stride_maximum, accu_ptr, stride_accu,
-        d_entropy_ptr, stride_d_entropy, d_logprobs_ptr, stride_d_logprobs, reduction: int, entropy_b_ptr, stride_entropy_b,
-        d_logits_ptr, stride_d_logits_m, stride_d_logits_n, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
-        BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+        num_tokens: int, hidden_size: int, vocab_size: int, rank: int, hidden_ptr, stride_hidden_m, stride_hidden_k,
+        weight_ptr, stride_weight_k, stride_weight_n, labels_ptr, stride_labels, maximum_ptr, stride_maximum, accu_ptr,
+        stride_accu, d_entropy_ptr, stride_d_entropy, d_logprobs_ptr, stride_d_logprobs, reduction: int, entropy_b_ptr,
+        stride_entropy_b, d_logits_ptr, stride_d_logits_m, stride_d_logits_n, BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
     """
     backward d_logits
     """
@@ -749,8 +723,8 @@ def efficient_entropy_backward_kernel_general_d_logits(
     exp_logits = tl.exp(logits - maximum[:, None])
 
     mask = (offs_bn + rank * vocab_size)[None, :] == labels[:, None]
-    d_logits = d_logprobs[:,None] * (exp_logits * accu_rcp[:,None] - mask)
-    d_logits += d_entropy[:,None] * (-exp_logits * accu_rcp[:,None]) * (logits - entropy_b[:,None])
+    d_logits = d_logprobs[:, None] * (exp_logits * accu_rcp[:, None] - mask)
+    d_logits += d_entropy[:, None] * (-exp_logits * accu_rcp[:, None]) * (logits - entropy_b[:, None])
 
     # store d_logits
     d_logits_ptrs = d_logits_ptr + offs_am[:, None] * stride_d_logits_m + offs_bn[None, :] * stride_d_logits_n
@@ -759,17 +733,17 @@ def efficient_entropy_backward_kernel_general_d_logits(
              mask=(offs_am[:, None] < num_tokens) & (offs_bn[None, :] < vocab_size))
 
 
-def efficient_entropy_backward(dlogprobs: torch.Tensor,
-                               dentropy: torch.Tensor,
-                               hidden: torch.Tensor,
-                               weight: torch.Tensor,
-                               labels: torch.Tensor,
-                               maximum: torch.Tensor,
-                               acc: torch.Tensor,
-                               entropy_b: torch.Tensor,
-                               reduction: typing.Optional[int] = 2,
-                               dist_process_group: typing.Optional[dist.ProcessGroup] = None
-    ) -> typing.List[torch.Tensor]:
+def efficient_entropy_backward(
+        dlogprobs: torch.Tensor,
+        dentropy: torch.Tensor,
+        hidden: torch.Tensor,
+        weight: torch.Tensor,
+        labels: torch.Tensor,
+        maximum: torch.Tensor,
+        acc: torch.Tensor,
+        entropy_b: torch.Tensor,
+        reduction: typing.Optional[int] = 2,
+        dist_process_group: typing.Optional[dist.ProcessGroup] = None) -> typing.List[torch.Tensor]:
     """
     backward host function
     """
