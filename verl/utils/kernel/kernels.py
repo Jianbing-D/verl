@@ -405,7 +405,9 @@ def efficient_entropy_triton_epilogue_tp_update(num_tokens,
         tl.atomic_add(logprobs_scalar_ptr, logprobs_scalar)
 
 
-def efficient_entropy_foward(hidden: torch.Tensor,
+_dedicated_stream, _dedicated_events = None, None
+
+def efficient_entropy_forward(hidden: torch.Tensor,
                              weight: torch.Tensor,
                              labels: torch.Tensor,
                              reduction: typing.Optional[int] = 2,
@@ -422,6 +424,12 @@ def efficient_entropy_foward(hidden: torch.Tensor,
 
     _rank = 0 if dist_process_group is None else dist.get_rank(dist_process_group)
     _world_size = 1 if dist_process_group is None else dist.get_world_size(dist_process_group)
+
+    if dist_process_group is not None and not hasattr(efficient_entropy_forward, "_initialized"):
+        global _dedicated_stream, _dedicated_events
+        _dedicated_stream = torch.cuda.Stream(hidden.device)
+        _dedicated_events = [torch.cuda.Event() for _ in range(2)]
+        efficient_entropy_forward._initialized = True
 
     num_tokens, hidden_size = hidden.shape
     num_tokens = labels.shape[0]
@@ -493,10 +501,14 @@ def efficient_entropy_foward(hidden: torch.Tensor,
                                                                 _logprobs.stride(0), logprobs, REDUCTION)
     else:
         # tensor-parallel
-        dist.all_reduce(_logprobs, op=dist.ReduceOp.SUM, group=dist_process_group)
-
         _max_backup = _max.clone()
         dist.all_reduce(_max, op=dist.ReduceOp.MAX, group=dist_process_group)
+
+        torch.cuda.current_stream().record_event(_dedicated_events[0])
+        with torch.cuda.stream(_dedicated_stream):
+            _dedicated_stream.wait_event(_dedicated_events[0])
+            dist.all_reduce(_logprobs, op=dist.ReduceOp.SUM, group=dist_process_group)
+            _dedicated_stream.record_event(_dedicated_events[1])
 
         efficient_entropy_triton_kernel_epilogue_tp[epilogue_grid](
             num_tokens, num_splits,
@@ -508,6 +520,7 @@ def efficient_entropy_foward(hidden: torch.Tensor,
             accumulate, accumulate.stride(0),
             entropy_b, entropy_b.stride(0)
         )
+        torch.cuda.current_stream().wait_event(_dedicated_events[1])
 
         dist.all_reduce(accumulate_and_entropy_b, op=dist.ReduceOp.SUM, group=dist_process_group)
 
