@@ -30,6 +30,7 @@
 # limitations under the License.
 
 import torch
+import torch.distributed as dist
 import typing
 from . import kernels
 
@@ -41,28 +42,32 @@ class LinearCrossEntropy(torch.autograd.Function):
                 hidden: torch.Tensor,
                 weight: torch.Tensor,
                 labels: torch.Tensor,
-                reduction: typing.Optional[str] = "mean") -> typing.List[torch.Tensor]:
+                reduction: typing.Optional[str] = "mean",
+                dist_process_group: typing.Optional[dist.ProcessGroup] = None) -> typing.List[torch.Tensor]:
         with torch.cuda.nvtx.range("LinearCrossEntropy-forward"):
             REDUCTION = kernels.get_entropy_reduction_enum_number(reduction.lower())
 
-            logprobs, entropy, _maximum, _acc, _d_scale =\
-                kernels.efficient_entropy_foward(hidden, weight, labels, REDUCTION)
+            logprobs, entropy, _maximum, _accumulate, _entropy_b =\
+                kernels.efficient_entropy_forward(hidden, weight, labels, REDUCTION,
+                                                 dist_process_group)
 
-            ctx.save_for_backward(hidden, weight, labels, _maximum, _acc, _d_scale)
+            ctx.save_for_backward(hidden, weight, labels, _maximum, _accumulate, _entropy_b)
             ctx.REDUCTION = REDUCTION
-
+            ctx.dist_process_group = dist_process_group
         return logprobs, entropy
 
     @staticmethod
     def backward(ctx, dlogprobs: torch.Tensor, dentropy: torch.Tensor) -> typing.List[torch.Tensor]:
         with torch.cuda.nvtx.range("LinearCrossEntropy-backward"):
-            (hidden, weight, labels, _maximum, _acc, _d_scale) = ctx.saved_tensors
+            (hidden, weight, labels, _maximum, _accumulate, _entropy_b) = ctx.saved_tensors
             REDUCTION = ctx.REDUCTION
+            dist_process_group = ctx.dist_process_group
 
             d_hidden, d_weight = kernels.efficient_entropy_backward(dlogprobs, dentropy, hidden, weight, labels,
-                                                                    _maximum, _acc, _d_scale, REDUCTION)
+                                                                    _maximum, _accumulate, _entropy_b, REDUCTION,
+                                                                    dist_process_group)
 
-        return (d_hidden, d_weight, None, None)
+        return (d_hidden, d_weight, None, None, None)
 
 
 linear_cross_entropy = LinearCrossEntropy.apply
