@@ -90,14 +90,30 @@ def apply_monkey_patch(model: PreTrainedModel):
 
     # TODO: VLM models only, unify monkey patch to LLM models.
     if model.config.model_type in ("qwen2_vl", "qwen2_5_vl"):  # patch remove padding for qwen2vl mrope
-        from verl.models.transformers.qwen2_vl import ulysses_flash_attn_forward
-        from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLFlashAttention2
-        from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLFlashAttention2
+        from verl.models.transformers.qwen2_vl import ulysses_flash_attn_forward, qwen2_vl_fused_forward
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLFlashAttention2, Qwen2ForCasalLM
+        from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLFlashAttention2, Qwen2_5_VLForConditionalGeneration
+        
+        Qwen2_5_VLForConditionalGeneration.forward = qwen2_vl_fused_forward
+        Qwen2ForCasalLM.forward = qwen2_fused_forward
 
         Qwen2VLFlashAttention2.forward = ulysses_flash_attn_forward
         Qwen2_5_VLFlashAttention2.forward = ulysses_flash_attn_forward
+        
         print("Monkey patch FlashAttention2.forward in Qwen2VL")
         return
+    elif model.config.model_type in ("llama", "qwen2"):
+        from verl.models.transformers.qwen2 import qwen2_fused_forward
+        from verl.models.transformers.llama import llama_fused_forward
+        
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
+        from transformers.models.llama.modeling_llama import LlamaFroCausalLM
+        
+        LlamaFroCausalLM.forward = llama_fused_forward
+        Qwen2ForCausalLM.forward = qwen2_fused_forward
+        
+        print("Monkey patch forward in Qwen2 and Llama")
+        
 
     # transformers<=4.47.1
     if hasattr(module, "_flash_attention_forward"):

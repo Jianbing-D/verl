@@ -26,11 +26,10 @@ from verl import DataProto
 from verl.trainer.ppo import core_algos
 from verl.workers.actor import BasePPOActor
 from verl.utils.py_functional import append_to_dict
-from verl.utils.torch_functional import logprobs_from_logits, masked_mean
+from verl.utils.torch_functional import masked_mean
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 import verl.utils.torch_functional as verl_F
-from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
 
@@ -53,12 +52,6 @@ class DataParallelPPOActor(BasePPOActor):
         print(f'Actor use_remove_padding={self.use_remove_padding}')
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
-        self.use_fused_kernels = config.use_fused_kernels
-
-        self.compute_entropy_from_logits = (
-            torch.compile(verl_F.entropy_from_logits, dynamic=True)
-            if self.config.get('use_torch_compile', True)  #  use torch compile by default
-            else verl_F.entropy_from_logits)
 
     def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -113,19 +106,14 @@ class DataParallelPPOActor(BasePPOActor):
                                            attention_mask=None,
                                            position_ids=position_ids_rmpad,
                                            **multi_modal_inputs,
-                                           use_cache=False)  # prevent model thinks we are generating
-                logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                                           use_cache=False,
+                                           labels=input_ids_rmpad_rolled,
+                                           temperature=temperature,
+                                           output_logits=False)  # prevent model thinks we are generating
+                entropy_rmpad = output.entropy
 
-                if not self.use_fused_kernels:
-                    logits_rmpad.div_(temperature)
-                    # compute entropy
-                    entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
-
-                    # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                    log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
-                else:
-                    weights = torch.eye(logits_rmpad.size(-1), device=logits_rmpad.device) / temperature
-                    log_probs, entropy_rmpad = linear_cross_entropy(logits_rmpad, weights, input_ids_rmpad_rolled)
+                # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
+                log_probs = output.log_probs
 
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
@@ -154,12 +142,12 @@ class DataParallelPPOActor(BasePPOActor):
                                            attention_mask=attention_mask,
                                            position_ids=position_ids,
                                            **multi_modal_inputs,
-                                           use_cache=False)  # prevent model thinks we are generating
-                logits = output.logits
-                logits.div_(temperature)
-                logits = logits[:, -response_length - 1:-1, :]  # (bsz, response_length, vocab_size)
-                log_probs = logprobs_from_logits(logits, micro_batch['responses'])
-                entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                                           use_cache=False,
+                                           labels=micro_batch['responses'],
+                                           temperature=temperature,
+                                           output_logits=False)  # prevent model thinks we are generating
+                entropy = output.entropy
+                log_probs = output.log_probs
 
             return entropy, log_probs
 

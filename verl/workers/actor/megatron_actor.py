@@ -159,14 +159,6 @@ class MegatronPPOActor(BasePPOActor):
         """
         data.batch = data.batch.contiguous()
 
-        def compute_logprobs_fn(output, data):
-            response = data['responses']
-            response_length = response.size(1)
-            logits = output['logits']
-            logits = logits[:, -response_length - 1:-1].contiguous()
-            log_probs = vocab_parallel_log_probs_from_logits(logits, response)
-            return {'log_probs': log_probs}
-
         # We make recompute_old_log_prob by default here.
         # TODO (zhangchi.usc1992): actually, this function should only return log_prob and this logic should be handled by user outside
         recompute_old_log_prob = self.config.get('recompute_old_log_prob', True)
@@ -179,7 +171,7 @@ class MegatronPPOActor(BasePPOActor):
             response = batch['responses']
             response_length = response.size(1)
             with torch.no_grad():
-                output = self.forward_backward_batch(data, forward_only=True, post_process_fn=compute_logprobs_fn)
+                output = self.forward_backward_batch(data, forward_only=True)
                 if mpu.is_pipeline_last_stage(ignore_virtual=True):
                     # only on last rank. It should be on every tp rank
                     log_probs = torch.cat([o['log_probs'] for o in output], dim=0)  # (bs, seq_size)
@@ -230,7 +222,7 @@ class MegatronPPOActor(BasePPOActor):
                                   epochs=self.config.ppo_epochs,
                                   dataloader_kwargs={'shuffle': self.config.shuffle})
 
-    def forward_backward_batch(self, data: DataProto, forward_only=False, post_process_fn=None):
+    def forward_backward_batch(self, data: DataProto, forward_only=False):
         """
         We assume:
         - The model takes input: (input_ids, attention_mask, position_ids). No rmpad for the input
@@ -262,12 +254,6 @@ class MegatronPPOActor(BasePPOActor):
         forward_backward_func = get_forward_backward_func()
 
         def loss_func(output, data, meta_info):
-            if forward_only:
-                if post_process_fn is None:
-                    return 1.0, {'logits': output.logits}
-                else:
-                    return 1.0, post_process_fn(output, data)
-
             responses = data['responses']
             response_length = responses.size(1)
             attention_mask = data['attention_mask']
@@ -279,17 +265,13 @@ class MegatronPPOActor(BasePPOActor):
             entropy_coeff = meta_info['entropy_coeff']
 
             # compute policy loss
-            logits = output.logits
-            logits = logits[:, -response_length - 1:-1].contiguous()
-            logits_back = logits.clone()
-            log_prob = vocab_parallel_log_probs_from_logits(logits, responses)
-            logits = logits_back
+            log_prob = output.log_probs
+            entropy_loss = output.entropy
             pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
                                                                           log_prob=log_prob,
                                                                           advantages=advantages,
                                                                           eos_mask=response_mask,
                                                                           cliprange=clip_ratio)
-            entropy_loss = vocab_parallel_compute_entropy_loss(logits, eos_mask=response_mask)
             policy_loss = pg_loss - entropy_loss * entropy_coeff
 
             metrics = {}
@@ -320,7 +302,9 @@ class MegatronPPOActor(BasePPOActor):
             input_ids = batch['input_ids']
             attention_mask = batch['attention_mask']
             position_ids = batch['position_ids']
-            output = model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids)
+            responses = data['responses']
+            temperature = data['temperature']
+            output = model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, labels=responses, temperature=temperature, output_logits=False)
             if forward_only:
                 meta_info = None
             else:
