@@ -292,7 +292,7 @@ def ulysses_flash_attn_forward(
     attn_output = self.o_proj(attn_output)
     return attn_output, None, None
 
-def qwen2_fused_forward(
+def qwen2_vl_fused_forward(
     self,
     input_ids: torch.LongTensor = None,
     attention_mask: Optional[torch.Tensor] = None,
@@ -310,6 +310,7 @@ def qwen2_fused_forward(
     video_grid_thw: Optional[torch.LongTensor] = None,
     rope_deltas: Optional[torch.LongTensor] = None,
     cache_position: Optional[torch.LongTensor] = None,
+    fuse_entropy_logprobs: bool = False,
 ) -> Union[Tuple, FusedCausalLMOutputWithPast]:
 
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -406,13 +407,13 @@ def qwen2_fused_forward(
     log_probs = None
     entropy = None
     
-    if self.training:
+    if self.training and fuse_entropy_logprobs:
         # TOCHECK: whether labels is not None is needed
         """
         To Squeeze:
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
             
-            logits = self.lm_head(hidden_states[:, slice_indices, :])
+            logits = self.lm_head(hidden_states)
         
             logits_rmpad = logits.squeeze(0)  # (total_nnz, vocab_size)
 
@@ -427,19 +428,20 @@ def qwen2_fused_forward(
     else:
         # Inferencce mode
         logits = self.lm_head(hidden_states)
-        if labels is not None:
-            # Upcast to float if we need to compute the loss to avoid potential precision issues
-            logits = logits.float()
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+        # loss may not needed
+        # if labels is not None:
+        #     # Upcast to float if we need to compute the loss to avoid potential precision issues
+        #     logits = logits.float()
+        #     # Shift so that tokens < n predict n
+        #     shift_logits = logits[..., :-1, :].contiguous()
+        #     shift_labels = labels[..., 1:].contiguous()
+        #     # Flatten the tokens
+        #     loss_fct = CrossEntropyLoss()
+        #     shift_logits = shift_logits.view(-1, self.config.vocab_size)
+        #     shift_labels = shift_labels.view(-1)
+        #     # Enable model parallelism
+        #     shift_labels = shift_labels.to(shift_logits.device)
+        #     loss = loss_fct(shift_logits, shift_labels)
         
     if not return_dict:
         output = (logits,) + outputs[1:]

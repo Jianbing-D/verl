@@ -242,6 +242,7 @@ def llama_fused_forward(
     cache_position: Optional[torch.LongTensor] = None,
     logits_to_keep: Union[int, torch.Tensor] = 0,
     temperature: Optional[float] = None,
+    fuse_entropy_logprobs: bool = False,
     **kwargs,
 ) -> Union[Tuple, FusedCausalLMOutputWithPast]:
     """
@@ -278,7 +279,7 @@ def llama_fused_forward(
     log_probs = None
     entropy = None
     
-    if self.training:
+    if self.training and fuse_entropy_logprobs:
         # TOCHECK: whether labels is not None is needed
         """
         To Squeeze:
@@ -299,8 +300,9 @@ def llama_fused_forward(
     else:
         # Inferencce mode
         logits = self.lm_head(hidden_states)
-        if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+        # loss is not needed
+        # if labels is not None:
+        #     loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
         
     if not return_dict:
         output = (logits,) + outputs[1:]
