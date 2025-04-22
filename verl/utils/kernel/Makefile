@@ -13,9 +13,9 @@ all: torch
 # kernel library
 DEP_FILES = $(wildcard ${CURRENT_DIR}/csrc/library/*.cu)
 DEP_FILES += $(wildcard ${CURRENT_DIR}/csrc/library/*.h)
-${BUILD_DIR}/library/liblce.so:
+${BUILD_DIR}/library/liblce.so: ${DEP_FILES}
 	+$(MAKE) -f ${CURRENT_DIR}/csrc/library/Makefile
-library: ${BUILD_DIR}/library/liblce.so
+library: ${BUILD_DIR}/library/liblce.so ${DEP_FILES}
 
 # torch wrapper
 torch: library

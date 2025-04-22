@@ -28,7 +28,7 @@ def main():
         "-lineinfo",
         "--use_fast_math",
         "--Werror", "all-warnings",
-        "-D_GLIBCXX_USE_CXX11_ABI=1"
+        # "-D_GLIBCXX_USE_CXX11_ABI=1"
     ]
     nvcc_flags.extend(cuda_archs)
 

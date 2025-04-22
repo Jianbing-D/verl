@@ -48,7 +48,7 @@ SRC_LIB = ${BUILD_DIR}/liblce.so
 ${BUILD_DIR}/%.obj: ${MAKEFILE_DIR}/%.cu ${DEP_FILES}
 	mkdir -p $(abspath $(dir $@))
 	${NVCC} ${NVCC_FLAGS} -c $< -o $@ ${_REAL_INC_PATH}
-${SRC_LIB}: ${SRC_OBJS_FULL} ${SRC_FILES}
+${SRC_LIB}: ${SRC_OBJS_FULL} ${SRC_FILES} ${DEP_FILES}
 	${NVCC} -shared -o $@ ${SRC_OBJS_FULL}
 
 build: get_cutlass ${SRC_LIB}
