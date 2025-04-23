@@ -34,6 +34,7 @@ struct Traits {
     static constexpr int32_t dim = _dim;
     static_assert(dim % tileK == 0, "dim must be divisible by tileK");
 
+    static constexpr int32_t threadBlockSwizzleSize = 4;
 
     // pipeline size
     static constexpr int32_t pipe = 3;
@@ -119,14 +120,25 @@ __global__ void forward_mainloop_kernel(int32_t rank,
                                         float *gmem_output_ptr) {
     extern __shared__ char smem_[];
     char *smem_aligned = (char*)(((intptr_t)smem_ + 1023) & ~1023);
-    (void)smem_aligned;
+
+    int32_t num_pid_m = (num_tokens + Traits::tileM - 1) / Traits::tileM;
+    int32_t num_pid_n = (vocab_size + vocab_per_split - 1) / vocab_per_split;
 
     const auto [pid_m, pid_n] = [&] () -> std::tuple<int32_t, int32_t> {
-        int32_t num_pid_m = (num_tokens + Traits::tileM - 1) / Traits::tileM;
-        int32_t pid_m = blockIdx.x % num_pid_m;
-        int32_t pid_n = blockIdx.x / num_pid_m;
+        // int32_t num_pid_m = (num_tokens + Traits::tileM - 1) / Traits::tileM;
+        // int32_t pid_m = blockIdx.x % num_pid_m;
+        // int32_t pid_n = blockIdx.x / num_pid_m;
+        // return {pid_m, pid_n};
+        int32_t gdimx = num_pid_m * Traits::threadBlockSwizzleSize;
+        int32_t bidm = blockIdx.x % gdimx;
+        int32_t bidn = blockIdx.x / gdimx;
+        int32_t pid_m = bidm / Traits::threadBlockSwizzleSize;
+        int32_t pid_n = bidn * Traits::threadBlockSwizzleSize + (bidm % Traits::threadBlockSwizzleSize);
         return {pid_m, pid_n};
     }();
+    if (pid_m >= num_pid_m || pid_n >= num_pid_n) {
+        return;
+    }
 
     Tensor mHidden = make_tensor(make_gmem_ptr(reinterpret_cast<typename Traits::IN_DTYPE*>(hidden_ptr)),
                                  make_shape(num_tokens, Int<Traits::dim>{}),

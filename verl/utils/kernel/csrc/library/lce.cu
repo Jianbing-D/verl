@@ -35,8 +35,15 @@ void forward_mainloop<__nv_bfloat16, __nv_bfloat16>(
 
     int32_t num_splits = (vocab_size + vocab_per_split - 1) / vocab_per_split;
 
+    // int32_t num_blocks = (num_tokens + Traits::tileM - 1) / Traits::tileM;
+    // num_blocks *= num_splits;
+
+    // thread-block swizzle
     int32_t num_blocks = (num_tokens + Traits::tileM - 1) / Traits::tileM;
-    num_blocks *= num_splits;
+    num_blocks *= Traits::threadBlockSwizzleSize;
+
+    num_blocks *= ((num_splits + Traits::threadBlockSwizzleSize - 1) / Traits::threadBlockSwizzleSize);
+
     dim3 block(Traits::threads, 1, 1);
     dim3 grid(num_blocks, 1, 1);
 
