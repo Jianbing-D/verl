@@ -17,7 +17,7 @@ using namespace cute;
 
 template <typename InT, typename OutT,
           int32_t _dim,
-          typename _ThreadLayout = _3DLayout<4, 1, 1>>
+          typename _ThreadLayout = _3DLayout<4, 2, 1>>
 struct Traits {
     using IN_DTYPE = InT;
     using OUT_DTYPE = OutT;
@@ -26,7 +26,7 @@ struct Traits {
     using ThreadLayout = _ThreadLayout;
     static_assert(ThreadLayout::K == 1, "ThreadLayout::K must be 1");
 
-    static constexpr int32_t tileM = 64;
+    static constexpr int32_t tileM = 128;
     static constexpr int32_t tileN = 64;
     static constexpr int32_t tileK = 128 / sizeof(InT);
 
@@ -60,7 +60,7 @@ struct Traits {
     using TiledMMA = TiledMMA<MMA_ATOM,
                              Layout<Shape<Int<ThreadLayout::M>, Int<ThreadLayout::N>, _1>>,
                              Tile<Int<get<0>(MMA_ATOM_TRAITS::Shape_MNK{}) * ThreadLayout::M>,
-                                  Int<get<1>(MMA_ATOM_TRAITS::Shape_MNK{}) * ThreadLayout::N>,
+                                  Int<get<1>(MMA_ATOM_TRAITS::Shape_MNK{}) * 2 * ThreadLayout::N>,
                                   Int<get<2>(MMA_ATOM_TRAITS::Shape_MNK{}) * ThreadLayout::K>>>;
     static constexpr int32_t threads = get<0>(shape(MMA_ATOM_TRAITS::ThrID{})) 
                                                   * ThreadLayout::M
@@ -81,6 +81,9 @@ struct Traits {
 
     // make sure all threads participate in the LDGSTS
     static_assert(size(TiledCopy{}) == threads, "all threads must participate in the LDGSTS");
+
+    using TiledLDSM_A = decltype(make_tiled_copy_A(LdsmAtom{}, TiledMMA{}));
+    using TiledLDSM_B = decltype(make_tiled_copy_B(LdsmAtom{}, TiledMMA{}));
 
     // the swizzle pattern is 128B, and repeated in 1024B
     static constexpr int32_t chunk_size_bits = std::is_same_v<IN_DTYPE, float> ? 2 : 3;
@@ -288,6 +291,24 @@ __global__ void forward_mainloop_kernel(int32_t rank,
     }
 #endif
 
+    // SMEM -> REG tiling
+    auto smem_tiled_copy_hidden = typename Traits::TiledLDSM_A{};
+    auto smem_thr_copy_hidden = smem_tiled_copy_hidden.get_thread_slice(threadIdx.x);
+    Tensor tSsH = smem_thr_copy_hidden.partition_S(sHidden); // (LDSMx4, LDSM_M, LDSM_K, pipe)
+    Tensor tCrH_copy_view = smem_thr_copy_hidden.retile_D(tCrH);
+
+    auto smem_tiled_copy_weight = typename Traits::TiledLDSM_B{};
+    auto smem_thr_copy_weight = smem_tiled_copy_weight.get_thread_slice(threadIdx.x);
+    Tensor tSsW = smem_thr_copy_weight.partition_S(sWeight);
+    Tensor tCrW_copy_view = smem_thr_copy_weight.retile_D(tCrW);
+
+#if 0
+    if (m_tile_id == 0 && threadIdx.x == 0) {
+        print("tSsH layout: "); print(tSsH); print("\n");
+        print("tSsW layout: "); print(tSsW); print("\n");
+    }
+#endif
+
 
     int32_t n_tile_count = size<3>(tBgW);
     for (int32_t n_tile = 0; n_tile < n_tile_count; ++n_tile) {
@@ -331,8 +352,10 @@ __global__ void forward_mainloop_kernel(int32_t rank,
         int32_t smem_pipe_read = 0;
         int32_t smem_pipe_write = Traits::pipe - 1;
 
-        Tensor tCsH_p = tCsH(_, _, _, smem_pipe_read); // (MMA, MMA_M, MMA_K)
-        Tensor tCsW_p = tCsW(_, _, _, smem_pipe_read); // (MMA, MMA_N, MMA_K)
+        // Tensor tCsH_p = tCsH(_, _, _, smem_pipe_read); // (MMA, MMA_M, MMA_K)
+        Tensor tCsH_p = tSsH(_, _, _, smem_pipe_read);
+        // Tensor tCsW_p = tCsW(_, _, _, smem_pipe_read); // (MMA, MMA_N, MMA_K)
+        Tensor tCsW_p = tSsW(_, _, _, smem_pipe_read);
 
         // prefetch first k-block
         constexpr int32_t k_block_max = size<2>(tCrH);
@@ -341,10 +364,16 @@ __global__ void forward_mainloop_kernel(int32_t rank,
             __syncthreads();
 
             // SMEM -> REG
-            copy(/*src=*/tCsH_p(_, _, Int<0>{}), 
-                 /*dst=*/tCrH(_, _, Int<0>{}));
-            copy(/*src=*/tCsW_p(_, _, Int<0>{}),
-                /*dst=*/tCrW(_, _, Int<0>{}));
+            // copy(/*src=*/tCsH_p(_, _, Int<0>{}), 
+            //      /*dst=*/tCrH(_, _, Int<0>{}));
+            copy(smem_tiled_copy_hidden, 
+                /*src=*/tCsH_p(_, _, Int<0>{}),
+                /*dst=*/tCrH_copy_view(_, _, Int<0>{}));
+            // copy(/*src=*/tCsW_p(_, _, Int<0>{}),
+            //     /*dst=*/tCrW(_, _, Int<0>{}));
+            copy(smem_tiled_copy_weight, 
+                /*src=*/tCsW_p(_, _, Int<0>{}),
+                /*dst=*/tCrW_copy_view(_, _, Int<0>{}));
         }
 
         // pipelined main loop on k-tiles
@@ -355,16 +384,24 @@ __global__ void forward_mainloop_kernel(int32_t rank,
             for (int32_t k = 0; k < k_block_max; ++k) {
                 // wait for k-tile to be loaded into SMEM
                 if (k == k_block_max - 1) {
-                    tCsH_p = tCsH(_, _, _, smem_pipe_read);
-                    tCsW_p = tCsW(_, _, _, smem_pipe_read);
+                    // tCsH_p = tCsH(_, _, _, smem_pipe_read);
+                    tCsH_p = tSsH(_, _, _, smem_pipe_read);
+                    // tCsW_p = tCsW(_, _, _, smem_pipe_read);
+                    tCsW_p = tSsW(_, _, _, smem_pipe_read);
                     cp_async_wait<Traits::pipe - 2>();
                     __syncthreads();
                 }
 
                 // SMEM -> REG for k+1
                 int32_t k_next = (k + Int<1>{}) % k_block_max;
-                copy(tCsH_p(_,_,k_next), tCrH(_,_,k_next));
-                copy(tCsW_p(_,_,k_next), tCrW(_,_,k_next));
+                // copy(tCsH_p(_,_,k_next), tCrH(_,_,k_next));
+                // copy(tCsW_p(_,_,k_next), tCrW(_,_,k_next));
+                copy(smem_tiled_copy_hidden,
+                     tCsH_p(_, _, k_next), 
+                     tCrH_copy_view(_, _, k_next));
+                copy(smem_tiled_copy_weight,
+                     tCsW_p(_, _, k_next),
+                     tCrW_copy_view(_, _, k_next));
 
                 // launch GMEM -> SMEM
                 if (k == 0) {
