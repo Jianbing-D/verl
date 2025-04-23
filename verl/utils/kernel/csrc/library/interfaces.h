@@ -5,6 +5,26 @@
 
 namespace lce {
 
+#define CUDA_NOTHROW(cmd)                                                                   \
+    do {                                                                                    \
+        cudaError_t err = (cmd);                                                            \
+        if (err != cudaSuccess) {                                                           \
+            printf("CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err));  \
+            exit(1);                                                                        \
+        }                                                                                   \
+    } while (0)
+
+#define CUDA_THROW(cmd)                                                                          \
+    do {                                                                                         \
+        cudaError_t err = (cmd);                                                                 \
+        if (err != cudaSuccess) {                                                                \
+            throw std::runtime_error(std::string("CUDA error: ") + __FILE__ + ":" +              \
+                                     std::to_string(__LINE__) + ": " + cudaGetErrorString(err) + \
+                                     std::string(" in ") + #cmd);                                \
+        }                                                                                        \
+    } while (0)
+
+
 template <typename InT, typename OutT>
 void forward_mainloop(int32_t rank,
                       void *hidden_ptr,

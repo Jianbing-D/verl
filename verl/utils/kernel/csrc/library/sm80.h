@@ -27,7 +27,7 @@ struct Traits {
     static_assert(ThreadLayout::K == 1, "ThreadLayout::K must be 1");
 
     static constexpr int32_t tileM = 128;
-    static constexpr int32_t tileN = 64;
+    static constexpr int32_t tileN = 256;
     static constexpr int32_t tileK = 128 / sizeof(InT);
 
     // length of elements per token, that is hidden_size
@@ -105,6 +105,7 @@ struct Traits {
 
 
 template <typename Traits>
+__launch_bounds__(Traits::threads)
 __global__ void forward_mainloop_kernel(int32_t rank,
                                         typename Traits::IN_DTYPE *hidden_ptr,
                                         int32_t stride_hidden_m, int32_t stride_hidden_k,
@@ -114,44 +115,69 @@ __global__ void forward_mainloop_kernel(int32_t rank,
                                         int32_t num_tokens,
                                         int32_t vocab_size,
                                         int32_t vocab_per_split,
+                                        int32_t num_splits,
                                         float *gmem_output_ptr) {
     extern __shared__ char smem_[];
     char *smem_aligned = (char*)(((intptr_t)smem_ + 1023) & ~1023);
     (void)smem_aligned;
 
-    int32_t m_tile_id = blockIdx.x;
+    const auto [pid_m, pid_n] = [&] () -> std::tuple<int32_t, int32_t> {
+        int32_t num_pid_m = (num_tokens + Traits::tileM - 1) / Traits::tileM;
+        int32_t pid_m = blockIdx.x % num_pid_m;
+        int32_t pid_n = blockIdx.x / num_pid_m;
+        return {pid_m, pid_n};
+    }();
 
     Tensor mHidden = make_tensor(make_gmem_ptr(reinterpret_cast<typename Traits::IN_DTYPE*>(hidden_ptr)),
                                  make_shape(num_tokens, Int<Traits::dim>{}),
                                  make_stride(Int<Traits::dim>{}, _1{}));
+    // (vocab_size, dim)
     Tensor mWeight = make_tensor(make_gmem_ptr(reinterpret_cast<typename Traits::IN_DTYPE*>(weight_ptr)),
                                  make_shape(vocab_size, Int<Traits::dim>{}),
                                  make_stride(Int<Traits::dim>{}, _1{}));
+
+    // (vocab_per_split, dim)
+    Tensor mWeight_n = local_tile(mWeight,
+                                  make_shape(vocab_per_split, Int<Traits::dim>{}),
+                                  make_coord(pid_n, Int<0>{}));
+
 #if 1
+    // (num_tokens, vocab_size)
     Tensor mC = make_tensor(make_gmem_ptr(reinterpret_cast<float*>(gmem_output_ptr)),
                             make_shape(num_tokens, vocab_size),
                             make_stride(vocab_size, _1{}));
+    // (num_tokens, vocab_per_split)
+    Tensor mC_n = local_tile(mC,
+                            make_shape(num_tokens, vocab_per_split),
+                            make_coord(Int<0>{}, pid_n));
 #endif
+    // if (pid_m == 0 && pid_n == 0 && threadIdx.x == 0) {
+    //     print("mWeight: "); print(mWeight); print("\n");
+    //     print("mWeight_n: "); print(mWeight_n); print("\n");
+    //     print("mC: "); print(mC); print("\n");
+    //     print("mC_n: "); print(mC_n); print("\n");
+    // }
+    // return;
 
 
     // [(tileM, tileK), k]
     Tensor gHidden = local_tile(mHidden, 
                                 Shape<Int<Traits::tileM>, Int<Traits::tileK>>{},
-                                make_coord(m_tile_id, _));
+                                make_coord(pid_m, _));
     // [(tileN, tileK), n, k]
-    Tensor gWeight = local_tile(mWeight,
+    Tensor gWeight = local_tile(mWeight_n,
                                 Shape<Int<Traits::tileN>, Int<Traits::tileK>>{},
                                 make_coord(_, _));
 #if 1
     // [(tileM, tileN), 1, n]
-    Tensor gC = local_tile(mC,
+    Tensor gC = local_tile(mC_n,
                            Shape<Int<Traits::tileM>, Int<Traits::tileN>>{},
-                           make_coord(m_tile_id, _));
+                           make_coord(pid_m, _));
 #endif
 
 #if 0
     // Print gHidden's shape
-    if (m_tile_id == 0 && threadIdx.x == 0) {
+    if (pid_m == 0 && threadIdx.x == 0) {
         printf("gHidden: (%d, %d, %d)\n",
                (int32_t)size<0>(gHidden),
                (int32_t)size<1>(gHidden),
@@ -173,7 +199,7 @@ __global__ void forward_mainloop_kernel(int32_t rank,
                                  typename Traits::SmemLayoutWeight{});
     
 #if 0
-    if (m_tile_id == 0 && threadIdx.x == 0) {
+    if (pid_m == 0 && threadIdx.x == 0) {
         printf("sHidden: (%d, %d, %d)\n",
                (int32_t)size<0>(sHidden),
                (int32_t)size<1>(sHidden),
@@ -214,12 +240,12 @@ __global__ void forward_mainloop_kernel(int32_t rank,
     Tensor tApH = make_tensor<bool>(make_shape(size<1>(tAsH))); // (CPY_M)
     CUTLASS_PRAGMA_UNROLL
     for (int32_t m = 0; m < size<0>(tApH); ++m) {
-        tApH(m) = get<0>(tAcH(0, m, 0)) < num_tokens - m_tile_id * Traits::tileM;
+        tApH(m) = get<0>(tAcH(0, m, 0)) < num_tokens - pid_m * Traits::tileM;
     }
     // predicate for weight along N
     Tensor tBpW = make_tensor<bool>(make_shape(size<1>(tBsW))); // (CPY_N)
 #if 0
-    if (m_tile_id == 0 && threadIdx.x == 0) {
+    if (pid_m == 0 && threadIdx.x == 0) {
         printf("tAgH: (%d, %d, %d, %d)\n",
                (int32_t)size<0>(tAgH),
                (int32_t)size<1>(tAgH),
@@ -275,7 +301,7 @@ __global__ void forward_mainloop_kernel(int32_t rank,
     Tensor tCrW = thr_mma.make_fragment_B(tCsW(_, _, _, 0));
 
 #if 0
-    if (m_tile_id == 0 && threadIdx.x == 0) {
+    if (pid_m == 0 && threadIdx.x == 0) {
         printf("tCsH: (%d, %d, %d, %d)\n",
                (int32_t)size<0>(tCsH),
                (int32_t)size<1>(tCsH),
@@ -303,7 +329,7 @@ __global__ void forward_mainloop_kernel(int32_t rank,
     Tensor tCrW_copy_view = smem_thr_copy_weight.retile_D(tCrW);
 
 #if 0
-    if (m_tile_id == 0 && threadIdx.x == 0) {
+    if (pid_m == 0 && threadIdx.x == 0) {
         print("tSsH layout: "); print(tSsH); print("\n");
         print("tSsW layout: "); print(tSsW); print("\n");
     }
@@ -311,11 +337,13 @@ __global__ void forward_mainloop_kernel(int32_t rank,
 
 
     int32_t n_tile_count = size<3>(tBgW);
+    int32_t vocab_left_bound = pid_n * vocab_per_split;
+    int32_t vocab_right_bound = min((pid_n + 1) * vocab_per_split, vocab_size);
     for (int32_t n_tile = 0; n_tile < n_tile_count; ++n_tile) {
         // update the predicate for weight along N
         CUTLASS_PRAGMA_UNROLL
         for (int32_t n = 0; n < size<0>(tBpW); ++n) {
-            tBpW(n) = get<0>(tBcW(0, n, 0)) < vocab_size - n_tile * Traits::tileN;
+            tBpW(n) = (vocab_left_bound + n_tile * Traits::tileN + get<0>(tBcW(0, n, 0)) < vocab_right_bound);
         }
 
         // Total count of tiles along K
@@ -448,8 +476,8 @@ __global__ void forward_mainloop_kernel(int32_t rank,
                 for (int32_t m = 0; m < size<1>(tCcC); ++m) {
                     #pragma unroll 
                     for (int32_t n = 0; n < size<2>(tCcC); ++n) {
-                        if (get<0>(tCcC(k, m, n)) < num_tokens - m_tile_id * Traits::tileM
-                            && get<1>(tCcC(k, m, n)) < vocab_size - n_tile * Traits::tileN) {
+                        if (get<0>(tCcC(k, m, n)) < num_tokens - pid_m * Traits::tileM
+                            && (vocab_left_bound + n_tile * Traits::tileN + get<1>(tCcC(k, m, n)) < vocab_right_bound)) {
                             tCgC(k, m, n, n_tile) = tCrO(k, m, n);
                         }
                     }

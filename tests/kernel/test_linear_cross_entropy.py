@@ -169,7 +169,7 @@ class TestLinearCrossEntropy:
         torch.cuda.synchronize()
 
     def generate_hyper(self):
-        self.num_tokens = 80
+        self.num_tokens = 10392
         self.hidden_size = 4096
         self.vocab_size = 152064
         self.dtype = torch.bfloat16
