@@ -9,6 +9,8 @@
 
 namespace lce {
 
+#define _ENABLE_GMEM_RESULT 0
+
 namespace cg = cooperative_groups;
 
 template <int32_t _M, int32_t _N, int32_t _K>
@@ -190,7 +192,7 @@ __global__ void forward_mainloop_kernel(int32_t rank,
     Tensor mLogprobs = make_tensor(make_gmem_ptr(reinterpret_cast<float*>(logprobs_ptr)),
                                    make_shape(num_tokens, _1{}));
 
-#if 1
+#if _ENABLE_GMEM_RESULT == 1
     // (num_tokens, vocab_size)
     Tensor mC = make_tensor(make_gmem_ptr(reinterpret_cast<float*>(gmem_output_ptr)),
                             make_shape(num_tokens, vocab_size),
@@ -200,14 +202,6 @@ __global__ void forward_mainloop_kernel(int32_t rank,
                             make_shape(num_tokens, vocab_per_split),
                             make_coord(Int<0>{}, pid_n));
 #endif
-    // if (pid_m == 0 && pid_n == 0 && threadIdx.x == 0) {
-    //     print("mWeight: "); print(mWeight); print("\n");
-    //     print("mWeight_n: "); print(mWeight_n); print("\n");
-    //     print("mC: "); print(mC); print("\n");
-    //     print("mC_n: "); print(mC_n); print("\n");
-    // }
-    // return;
-
 
     // [(tileM, tileK), k]
     Tensor gHidden = local_tile(mHidden, 
@@ -238,28 +232,13 @@ __global__ void forward_mainloop_kernel(int32_t rank,
                                   Shape<Int<Traits::tileM>, _1>{},
                                   make_coord(pid_m, Int<0>{}));
 
-#if 1
+#if _ENABLE_GMEM_RESULT == 1
     // [(tileM, tileN), 1, n]
     Tensor gC = local_tile(mC_n,
                            Shape<Int<Traits::tileM>, Int<Traits::tileN>>{},
                            make_coord(pid_m, _));
 #endif
 
-#if 0
-    // Print gHidden's shape
-    if (pid_m == 0 && threadIdx.x == 0) {
-        printf("gHidden: (%d, %d, %d)\n",
-               (int32_t)size<0>(gHidden),
-               (int32_t)size<1>(gHidden),
-               (int32_t)size<2>(gHidden));
-
-        printf("gWeight: (%d, %d, %d, %d)\n",
-               (int32_t)size<0>(gWeight),
-               (int32_t)size<1>(gWeight),
-               (int32_t)size<2>(gWeight),
-               (int32_t)size<3>(gWeight));
-    }
-#endif
     // (tileM, tileK, pipe)
     Tensor sHidden = make_tensor(make_smem_ptr(reinterpret_cast<typename Traits::IN_DTYPE*>(smem_aligned)),
                                  typename Traits::SmemLayoutHidden{});
@@ -279,20 +258,6 @@ __global__ void forward_mainloop_kernel(int32_t rank,
                                         + Traits::smem_output_bytes)),
                                  typename Traits::SmemLinearLayout{});    
                                 
-                                
-#if 0
-    if (pid_m == 0 && threadIdx.x == 0) {
-        printf("sHidden: (%d, %d, %d)\n",
-               (int32_t)size<0>(sHidden),
-               (int32_t)size<1>(sHidden),
-               (int32_t)size<2>(sHidden));
-
-        printf("sWeight: (%d, %d, %d)\n",
-               (int32_t)size<0>(sWeight),
-               (int32_t)size<1>(sWeight),
-               (int32_t)size<2>(sWeight));
-    }
-#endif
     // GMEM -> SMEM
     typename Traits::TiledCopy gmem_tiled_copy_hidden;
     typename Traits::TiledCopy gmem_tiled_copy_weight;
@@ -326,51 +291,15 @@ __global__ void forward_mainloop_kernel(int32_t rank,
     }
     // predicate for weight along N
     Tensor tBpW = make_tensor<bool>(make_shape(size<1>(tBsW))); // (CPY_N)
-#if 0
-    if (pid_m == 0 && threadIdx.x == 0) {
-        printf("tAgH: (%d, %d, %d, %d)\n",
-               (int32_t)size<0>(tAgH),
-               (int32_t)size<1>(tAgH),
-               (int32_t)size<2>(tAgH),
-               (int32_t)size<3>(tAgH));
-
-        printf("tAsH: (%d, %d, %d, %d)\n",
-               (int32_t)size<0>(tAsH),
-               (int32_t)size<1>(tAsH),
-               (int32_t)size<2>(tAsH),
-               (int32_t)size<3>(tAsH));
-
-        printf("tBgW: (%d, %d, %d, %d, %d)\n",
-               (int32_t)size<0>(tBgW),
-               (int32_t)size<1>(tBgW),
-               (int32_t)size<2>(tBgW),
-               (int32_t)size<3>(tBgW),
-               (int32_t)size<4>(tBgW));
-
-        printf("tBsW: (%d, %d, %d, %d)\n",
-               (int32_t)size<0>(tBsW),
-               (int32_t)size<1>(tBsW),
-               (int32_t)size<2>(tBsW),
-               (int32_t)size<3>(tBsW));
-
-        print("tAgH layout: "); print(tAgH); print("\n");
-        print("tAcH layout: "); print(tAcH); print("\n");
-        print("tAcH[0, 0, 0]: "); print(tAcH(0, 0, 0)); print("\n");
-        print("get<0>(tAcH(0, 0, 0)): "); print(get<0>(tAcH(0, 0, 0))); print("\n");
-        print("tAcH[0, 1, 0]: "); print(tAcH(0, 1, 0)); print("\n");
-        print("get<0>(tAcH(0, 1, 0)): "); print(get<0>(tAcH(0, 1, 0))); print("\n");
-    }
-#endif
 
     typename Traits::TiledMMA tiled_mma;
     ThrMMA thr_mma = tiled_mma.get_slice(threadIdx.x);
     Tensor tCsH = thr_mma.partition_A(sHidden); // (MMA, MMA_M, MMA_K, pipe)
     Tensor tCsW = thr_mma.partition_B(sWeight); // (MMA, MMA_N, MMA_K, pipe)
 
-    Tensor cC = make_identity_tensor(make_shape(size<0>(gC), size<1>(gC)));
+    Tensor cC = make_identity_tensor(make_shape(size<0>(sLogit), size<1>(sLogit)));
+#if _ENABLE_GMEM_RESULT == 1
     Tensor tCcC = thr_mma.partition_C(cC); // (MMA, MMA_M, MMA_N)
-
-#if 1
     Tensor tCgC = thr_mma.partition_C(gC); // (MMA, MMA_M, MMA_N, n)
 #endif
 
@@ -381,23 +310,6 @@ __global__ void forward_mainloop_kernel(int32_t rank,
     // allocate register for pipelining
     Tensor tCrH = thr_mma.make_fragment_A(tCsH(_, _, _, 0));
     Tensor tCrW = thr_mma.make_fragment_B(tCsW(_, _, _, 0));
-
-#if 0
-    if (pid_m == 0 && threadIdx.x == 0) {
-        printf("tCsH: (%d, %d, %d, %d)\n",
-               (int32_t)size<0>(tCsH),
-               (int32_t)size<1>(tCsH),
-               (int32_t)size<2>(tCsH),
-               (int32_t)size<3>(tCsH));
-
-        printf("tCrO: (%d, %d, %d)\n",
-               (int32_t)size<0>(tCrO),
-               (int32_t)size<1>(tCrO),
-               (int32_t)size<2>(tCrO));
-
-        print("tCsH layout: "); print(tCsH); print("\n");
-    }
-#endif
 
     // SMEM -> REG tiling
     auto smem_tiled_copy_hidden = typename Traits::TiledLDSM_A{};
@@ -410,12 +322,6 @@ __global__ void forward_mainloop_kernel(int32_t rank,
     Tensor tSsW = smem_thr_copy_weight.partition_S(sWeight);
     Tensor tCrW_copy_view = smem_thr_copy_weight.retile_D(tCrW);
 
-#if 0
-    if (pid_m == 0 && threadIdx.x == 0) {
-        print("tSsH layout: "); print(tSsH); print("\n");
-        print("tSsW layout: "); print(tSsW); print("\n");
-    }
-#endif
     auto smem_tiled_copy_output = make_tiled_copy_C(Copy_Atom<UniversalCopy<uint64_t, uint64_t>, float>{},
                                                     tiled_mma);
     auto smem_thr_copy_output = smem_tiled_copy_output.get_thread_slice(threadIdx.x);
@@ -432,7 +338,9 @@ __global__ void forward_mainloop_kernel(int32_t rank,
                   "gmem_tiled_copy_output must have the same number of threads as the number of threads in the block");
     static_assert(Traits::tileN % 128 == 0, "tileN must be divisible by 128");
     auto gmem_thr_copy_output = gmem_tiled_copy_output.get_thread_slice(threadIdx.x);
+#if _ENABLE_GMEM_RESULT == 1
     Tensor tCgC_copy_view = gmem_thr_copy_output.partition_D(gC);
+#endif
     Tensor tSsO_copy_view = gmem_thr_copy_output.partition_S(sLogit);
     Tensor tCcOutput = gmem_thr_copy_output.partition_D(cC);
 
@@ -470,17 +378,6 @@ __global__ void forward_mainloop_kernel(int32_t rank,
         }
     }
     cp_async_fence();
-
-#if 0
-    if (pid_m == 0 && pid_n == 0 && threadIdx.x == 0) {
-        print("tCcOutput layout: "); print(tCcOutput); print("\n");
-        print("tCcOutput(0, 0, 0): "); print(tCcOutput(0, 0, 0)); print("\n");
-        print("tCcOutput(1, 0, 0): "); print(tCcOutput(1, 0, 0)); print("\n");
-        print("tCcOutput(0, 1, 0): "); print(tCcOutput(0, 1, 0)); print("\n");
-        print("tSsO_copy_view layout: "); print(tSsO_copy_view); print("\n");
-        print("tCgC_copy_view layout: "); print(tCgC_copy_view); print("\n");
-    }
-#endif
 
     float max_val[size<1>(tSrLogit_copy_view)] = {0.f};
     float accumulate[size<1>(tSrLogit_copy_view)] = {0.f};
@@ -542,13 +439,9 @@ __global__ void forward_mainloop_kernel(int32_t rank,
             __syncthreads();
 
             // SMEM -> REG
-            // copy(/*src=*/tCsH_p(_, _, Int<0>{}), 
-            //      /*dst=*/tCrH(_, _, Int<0>{}));
             copy(smem_tiled_copy_hidden, 
                 /*src=*/tCsH_p(_, _, Int<0>{}),
                 /*dst=*/tCrH_copy_view(_, _, Int<0>{}));
-            // copy(/*src=*/tCsW_p(_, _, Int<0>{}),
-            //     /*dst=*/tCrW(_, _, Int<0>{}));
             copy(smem_tiled_copy_weight, 
                 /*src=*/tCsW_p(_, _, Int<0>{}),
                 /*dst=*/tCrW_copy_view(_, _, Int<0>{}));
@@ -623,7 +516,7 @@ __global__ void forward_mainloop_kernel(int32_t rank,
                 /*dst=*/tSsO);
         __syncthreads();
 
-    #if 1
+    #if _ENABLE_GMEM_RESULT == 1
         if (gmem_output_ptr != nullptr) {
             // -------------- REG -> GMEM
             // #pragma unroll
@@ -823,6 +716,8 @@ __global__ void forward_mainloop_kernel(int32_t rank,
         }
     }
 }
+
+#undef _ENABLE_GMEM_RESULT
 
 } // namespace lce
 #endif

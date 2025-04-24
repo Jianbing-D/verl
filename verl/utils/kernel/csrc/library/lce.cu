@@ -42,9 +42,6 @@ void forward_mainloop<__nv_bfloat16, __nv_bfloat16>(int32_t rank,
         throw std::invalid_argument("last split size must be divisible by 4 for address alignment");
     }
 
-    // int32_t num_blocks = (num_tokens + Traits::tileM - 1) / Traits::tileM;
-    // num_blocks *= num_splits;
-
     // thread-block swizzle
     int32_t num_blocks = (num_tokens + Traits::tileM - 1) / Traits::tileM;
     num_blocks *= Traits::threadBlockSwizzleSize;
