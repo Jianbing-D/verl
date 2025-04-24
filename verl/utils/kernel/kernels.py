@@ -39,6 +39,13 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
+import os
+import sys
+ext_path = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
+                                        "./csrc/torch/"))
+sys.path.append(ext_path)
+import linear_cross_entropy_extension as lce_ext
+
 
 @dataclass
 class EntropyReductionEnum:
@@ -457,17 +464,31 @@ def efficient_entropy_forward(
     assert _accu.is_contiguous() and _entropy_b.is_contiguous() and _max.is_contiguous()
     assert _accu.is_cuda and _entropy_b.is_cuda and _max.is_cuda
 
-    # 1D kernel launch, then split the tile
-    def mainloop_grid(meta):
-        return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]) * num_splits,)
+    use_triton = False
+    if use_triton:
+        # 1D kernel launch, then split the tile
+        def mainloop_grid(meta):
+            return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]) * num_splits,)
 
-    efficient_entropy_kernel_general_mainloop[mainloop_grid](_rank, hidden, weight, labels, num_tokens, hidden_size,
-                                                             vocab_size, vocab_per_split, hidden.stride(0),
-                                                             hidden.stride(1), weight.stride(0), weight.stride(1), _max,
-                                                             _max.stride(0), _max.stride(1), _accu, _accu.stride(0),
-                                                             _accu.stride(1), _entropy_b, _entropy_b.stride(0),
-                                                             _entropy_b.stride(1), _logprobs, _logprobs.stride(0),
-                                                             logprobs)
+        efficient_entropy_kernel_general_mainloop[mainloop_grid](_rank, hidden, weight, labels, num_tokens, hidden_size,
+                                                                vocab_size, vocab_per_split, hidden.stride(0),
+                                                                hidden.stride(1), weight.stride(0), weight.stride(1), _max,
+                                                                _max.stride(0), _max.stride(1), _accu, _accu.stride(0),
+                                                                _accu.stride(1), _entropy_b, _entropy_b.stride(0),
+                                                                _entropy_b.stride(1), _logprobs, _logprobs.stride(0),
+                                                                logprobs)
+    else:
+        _weight = weight.T.contiguous()
+        lce_ext.forward_mainloop(hidden, hidden.stride(0), hidden.stride(1),
+                                _weight, _weight.stride(0), _weight.stride(1),
+                                labels, labels.stride(0),
+                                _rank,
+                                num_tokens, vocab_size, hidden_size,
+                                vocab_per_split,
+                                _max, _max.stride(0), _max.stride(1),
+                                _accu, _accu.stride(0), _accu.stride(1),
+                                _entropy_b, _entropy_b.stride(0), _entropy_b.stride(1),
+                                _logprobs, logprobs, None)
 
     # reduction on maximum and maximum_indices
     def epilogue_grid(meta):

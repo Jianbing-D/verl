@@ -30,15 +30,31 @@ void forward_mainloop(torch::Tensor &hidden, int32_t stride_hidden_m, int32_t st
                       std::optional<torch::Tensor> gmem_output = std::nullopt) {
     auto stream = c10::cuda::getCurrentCUDAStream(hidden.device().index());
 
+    TORCH_CHECK(hidden.dim() == 2, "hidden must be a 2D tensor");
+    TORCH_CHECK(weight.dim() == 2, "weight must be a 2D tensor");
+    TORCH_CHECK(hidden.size(0) == num_tokens, "hidden.size(0) must be equal to num_tokens");
+    TORCH_CHECK(hidden.size(1) == hidden_size, "hidden.size(1) must be equal to hidden_size");
+    TORCH_CHECK(weight.size(0) == vocab_size, "weight.size(0) must be equal to vocab_size");
+    TORCH_CHECK(weight.size(1) == hidden_size, "weight.size(1) must be equal to hidden_size");
+    TORCH_CHECK(labels.dim() == 1, "labels must be a 1D tensor");
+    TORCH_CHECK(_max.dim() == 2, "_max must be a 2D tensor");
+    TORCH_CHECK(_acc.dim() == 2, "_acc must be a 2D tensor");
+    TORCH_CHECK(_entropy_b.dim() == 2, "_entropy_b must be a 2D tensor");
+    TORCH_CHECK(final_logprobs.dim() == 1, "final_logprobs must be a 1D tensor");
+
     KERNEL_WITH_DTYPE(hidden.dtype(), IN_DTYPE,
         lce::forward_mainloop<IN_DTYPE, IN_DTYPE>(
             rank, 
-            hidden.data_ptr(), stride_hidden_m, stride_hidden_k,
-            weight.data_ptr(), stride_weight_n, stride_weight_k,
-            reinterpret_cast<uint64_t *>(labels.data_ptr()),
+            hidden.data_ptr(),
+            weight.data_ptr(),
+            reinterpret_cast<int64_t *>(labels.data_ptr()),
             num_tokens,
             vocab_size,
             vocab_per_split,
+            _max.data_ptr(), 
+            _acc.data_ptr(),
+            _entropy_b.data_ptr(),
+            final_logprobs.data_ptr(),
             gmem_output.has_value() ? (float*)gmem_output.value().data_ptr() : (float*)nullptr,
             stream
         );

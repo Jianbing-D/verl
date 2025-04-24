@@ -4,36 +4,43 @@
 namespace lce {
 
 template <>
-void forward_mainloop<float, float>(
-                    int32_t rank,
-                    void *hidden_ptr,
-                    int32_t stride_hidden_m, int32_t stride_hidden_k,
-                    void *weight_ptr,
-                    int32_t stride_weight_n, int32_t stride_weight_k,
-                    uint64_t *labels_ptr,
-                    int32_t num_tokens,
-                    int32_t vocab_size,
-                    int32_t vocab_per_split,
-                    float *gmem_output_ptr,
-                    cudaStream_t stream) {}
+void forward_mainloop<float, float>(int32_t rank,
+                                    void *hidden_ptr,
+                                    void *weight_ptr,
+                                    int64_t *labels_ptr,
+                                    int32_t num_tokens,
+                                    int32_t vocab_size,
+                                    int32_t vocab_per_split,
+                                    void *max_ptr,
+                                    void *acc_ptr,
+                                    void *entropy_b_ptr,
+                                    void *logprobs_ptr,
+                                    float *gmem_output_ptr,
+                                    cudaStream_t stream) {}
 
 template <>
-void forward_mainloop<__nv_bfloat16, __nv_bfloat16>(
-                    int32_t rank,
-                    void *hidden_ptr,
-                    int32_t stride_hidden_m, int32_t stride_hidden_k,
-                    void *weight_ptr,
-                    int32_t stride_weight_n, int32_t stride_weight_k,
-                    uint64_t *labels_ptr,
-                    int32_t num_tokens,
-                    int32_t vocab_size,
-                    int32_t vocab_per_split,
-                    float *gmem_output_ptr,
-                    cudaStream_t stream) {
+void forward_mainloop<__nv_bfloat16, __nv_bfloat16>(int32_t rank,
+                                                    void *hidden_ptr,
+                                                    void *weight_ptr,
+                                                    int64_t *labels_ptr,
+                                                    int32_t num_tokens,
+                                                    int32_t vocab_size,
+                                                    int32_t vocab_per_split,
+                                                    void *max_ptr,
+                                                    void *acc_ptr,
+                                                    void *entropy_b_ptr,
+                                                    void *logprobs_ptr,
+                                                    float *gmem_output_ptr,
+                                                    cudaStream_t stream) {
     // first, lets check whether the GEMM is correct
     using Traits = lce::Traits<__nv_bfloat16, __nv_bfloat16, 4096>;
 
     int32_t num_splits = (vocab_size + vocab_per_split - 1) / vocab_per_split;
+    int32_t last_split_size = vocab_size - (num_splits - 1) * vocab_per_split;
+    if (last_split_size % 4 != 0) {
+        // NOTE: such requirement is due to the GMEM vectorized store
+        throw std::invalid_argument("last split size must be divisible by 4 for address alignment");
+    }
 
     // int32_t num_blocks = (num_tokens + Traits::tileM - 1) / Traits::tileM;
     // num_blocks *= num_splits;
@@ -64,14 +71,16 @@ void forward_mainloop<__nv_bfloat16, __nv_bfloat16>(
     kernel<<<grid, block, Traits::smem_bytes, stream>>>(
         rank,
         reinterpret_cast<typename Traits::IN_DTYPE*>(hidden_ptr),
-        stride_hidden_m, stride_hidden_k,
         reinterpret_cast<typename Traits::IN_DTYPE*>(weight_ptr),
-        stride_weight_n, stride_weight_k,
         labels_ptr,
         num_tokens,
         vocab_size,
         vocab_per_split,
         num_splits,
+        reinterpret_cast<float*>(max_ptr),
+        reinterpret_cast<float*>(acc_ptr),
+        reinterpret_cast<float*>(entropy_b_ptr),
+        reinterpret_cast<float*>(logprobs_ptr),
         reinterpret_cast<float*>(gmem_output_ptr)
     );
     CUDA_THROW(cudaGetLastError());

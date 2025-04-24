@@ -4,7 +4,12 @@
 #include <cstdint>
 #include <cute/tensor.hpp>
 
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+
 namespace lce {
+
+namespace cg = cooperative_groups;
 
 template <int32_t _M, int32_t _N, int32_t _K>
 struct _3DLayout {
@@ -27,7 +32,7 @@ struct Traits {
     static_assert(ThreadLayout::K == 1, "ThreadLayout::K must be 1");
 
     static constexpr int32_t tileM = 128;
-    static constexpr int32_t tileN = 256;
+    static constexpr int32_t tileN = 128;
     static constexpr int32_t tileK = 128 / sizeof(InT);
 
     // length of elements per token, that is hidden_size
@@ -100,8 +105,19 @@ struct Traits {
     static constexpr size_t smem_hidden_bytes = sizeof(InT) * size(SmemLayoutHidden{});
     static constexpr size_t smem_weight_bytes = sizeof(InT) * size(SmemLayoutWeight{}); 
 
-    static constexpr size_t smem_bytes = smem_hidden_bytes + smem_weight_bytes
-                                          + 1024; // additional 1024 bytes for alignment
+    using SmemLayoutOutput = decltype(tile_to_shape(SmemLayoutAtom{},
+                                                    Shape<Int<tileM>, Int<tileN>>{}));
+    static constexpr size_t smem_output_bytes = sizeof(float) * size(SmemLayoutOutput{});
+
+    using SmemLinearLayout = Layout<Shape<Int<tileM>, _1>,
+                                    Stride<_1, Int<tileM>>>;
+    static constexpr size_t smem_labels_bytes = sizeof(int64_t) * size(SmemLinearLayout{});
+
+    static constexpr size_t smem_bytes = smem_hidden_bytes 
+                                        + smem_weight_bytes 
+                                        + smem_output_bytes
+                                        + smem_labels_bytes
+                                        + 1024; // additional 1024 bytes for alignment
 };
 
 
@@ -109,17 +125,22 @@ template <typename Traits>
 __launch_bounds__(Traits::threads)
 __global__ void forward_mainloop_kernel(int32_t rank,
                                         typename Traits::IN_DTYPE *hidden_ptr,
-                                        int32_t stride_hidden_m, int32_t stride_hidden_k,
                                         typename Traits::IN_DTYPE *weight_ptr,
-                                        int32_t stride_weight_n, int32_t stride_weight_k,
-                                        uint64_t *labels_ptr,
+                                        int64_t *labels_ptr,
                                         int32_t num_tokens,
                                         int32_t vocab_size,
                                         int32_t vocab_per_split,
                                         int32_t num_splits,
+                                        float *max_ptr,
+                                        float *acc_ptr,
+                                        float *entropy_b_ptr,
+                                        float *logprobs_ptr,
                                         float *gmem_output_ptr) {
     extern __shared__ char smem_[];
     char *smem_aligned = (char*)(((intptr_t)smem_ + 1023) & ~1023);
+
+    auto block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<32>(block);
 
     int32_t num_pid_m = (num_tokens + Traits::tileM - 1) / Traits::tileM;
     int32_t num_pid_n = (vocab_size + vocab_per_split - 1) / vocab_per_split;
@@ -136,9 +157,7 @@ __global__ void forward_mainloop_kernel(int32_t rank,
         int32_t pid_n = bidn * Traits::threadBlockSwizzleSize + (bidm % Traits::threadBlockSwizzleSize);
         return {pid_m, pid_n};
     }();
-    if (pid_m >= num_pid_m || pid_n >= num_pid_n) {
-        return;
-    }
+    if (pid_m >= num_pid_m || pid_n >= num_pid_n) { return; }
 
     Tensor mHidden = make_tensor(make_gmem_ptr(reinterpret_cast<typename Traits::IN_DTYPE*>(hidden_ptr)),
                                  make_shape(num_tokens, Int<Traits::dim>{}),
@@ -152,6 +171,24 @@ __global__ void forward_mainloop_kernel(int32_t rank,
     Tensor mWeight_n = local_tile(mWeight,
                                   make_shape(vocab_per_split, Int<Traits::dim>{}),
                                   make_coord(pid_n, Int<0>{}));
+    // (num_tokens, 1)
+    Tensor mLabels = make_tensor(make_gmem_ptr(reinterpret_cast<int64_t*>(labels_ptr)),
+                                 make_shape(num_tokens, _1{}));
+
+    // (num_tokens, num_splits)
+    Tensor mMax = make_tensor(make_gmem_ptr(reinterpret_cast<float*>(max_ptr)),
+                              make_shape(num_tokens, num_splits),
+                              make_stride(num_splits, _1{}));
+    Tensor mAcc = make_tensor(make_gmem_ptr(reinterpret_cast<float*>(acc_ptr)),
+                              make_shape(num_tokens, num_splits),
+                              make_stride(num_splits, _1{}));
+    Tensor mEntropyB = make_tensor(make_gmem_ptr(reinterpret_cast<float*>(entropy_b_ptr)),
+                                   make_shape(num_tokens, num_splits),
+                                   make_stride(num_splits, _1{}));
+
+    // (num_tokens, 1)
+    Tensor mLogprobs = make_tensor(make_gmem_ptr(reinterpret_cast<float*>(logprobs_ptr)),
+                                   make_shape(num_tokens, _1{}));
 
 #if 1
     // (num_tokens, vocab_size)
@@ -180,6 +217,27 @@ __global__ void forward_mainloop_kernel(int32_t rank,
     Tensor gWeight = local_tile(mWeight_n,
                                 Shape<Int<Traits::tileN>, Int<Traits::tileK>>{},
                                 make_coord(_, _));
+    // (tileM, 1)
+    Tensor gLabels = local_tile(mLabels,
+                                Shape<Int<Traits::tileM>, _1>{},
+                                make_coord(pid_m, Int<0>{}));
+
+    // (tileM, 1)
+    Tensor gMax = local_tile(mMax,
+                             Shape<Int<Traits::tileM>, _1>{},
+                             make_coord(pid_m, pid_n));
+    Tensor gAcc = local_tile(mAcc,
+                             Shape<Int<Traits::tileM>, _1>{},
+                             make_coord(pid_m, pid_n));
+    Tensor gEntropyB = local_tile(mEntropyB,
+                                   Shape<Int<Traits::tileM>, _1>{},
+                                   make_coord(pid_m, pid_n));
+
+    // (tileM, 1)
+    Tensor gLogprobs = local_tile(mLogprobs,
+                                  Shape<Int<Traits::tileM>, _1>{},
+                                  make_coord(pid_m, Int<0>{}));
+
 #if 1
     // [(tileM, tileN), 1, n]
     Tensor gC = local_tile(mC_n,
@@ -209,7 +267,19 @@ __global__ void forward_mainloop_kernel(int32_t rank,
     Tensor sWeight = make_tensor(make_smem_ptr(reinterpret_cast<typename Traits::IN_DTYPE*>(smem_aligned
                                         + Traits::smem_hidden_bytes)),
                                  typename Traits::SmemLayoutWeight{});
-    
+    // (tileM, tileN)
+    Tensor sLogit = make_tensor(make_smem_ptr(reinterpret_cast<float*>(smem_aligned
+                                        + Traits::smem_hidden_bytes
+                                        + Traits::smem_weight_bytes)),
+                                 typename Traits::SmemLayoutOutput{});
+    // (tileM, 1)
+    Tensor sLabels = make_tensor(make_smem_ptr(reinterpret_cast<int64_t*>(smem_aligned
+                                        + Traits::smem_hidden_bytes
+                                        + Traits::smem_weight_bytes
+                                        + Traits::smem_output_bytes)),
+                                 typename Traits::SmemLinearLayout{});    
+                                
+                                
 #if 0
     if (pid_m == 0 && threadIdx.x == 0) {
         printf("sHidden: (%d, %d, %d)\n",
@@ -346,7 +416,75 @@ __global__ void forward_mainloop_kernel(int32_t rank,
         print("tSsW layout: "); print(tSsW); print("\n");
     }
 #endif
+    auto smem_tiled_copy_output = make_tiled_copy_C(Copy_Atom<UniversalCopy<uint64_t, uint64_t>, float>{},
+                                                    tiled_mma);
+    auto smem_thr_copy_output = smem_tiled_copy_output.get_thread_slice(threadIdx.x);
+    Tensor tSsO = smem_thr_copy_output.partition_D(sLogit);
+    Tensor tCrO_copy_view = smem_thr_copy_output.retile_S(tCrO);
 
+    // LDS.128 or STS.128
+    auto gmem_tiled_copy_output = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t, uint128_t>, float>{},
+                                                  /*thr=*/Layout<Shape<Int<Traits::threads / 32>, _32>,
+                                                                 Stride<_32, _1>>{},
+                                                  /*value=*/Layout<Shape<_1, _4>,
+                                                                   Stride<_4, _1>>{});
+    static_assert(size(gmem_tiled_copy_output) == Traits::threads, 
+                  "gmem_tiled_copy_output must have the same number of threads as the number of threads in the block");
+    static_assert(Traits::tileN % 128 == 0, "tileN must be divisible by 128");
+    auto gmem_thr_copy_output = gmem_tiled_copy_output.get_thread_slice(threadIdx.x);
+    Tensor tCgC_copy_view = gmem_thr_copy_output.partition_D(gC);
+    Tensor tSsO_copy_view = gmem_thr_copy_output.partition_S(sLogit);
+    Tensor tCcOutput = gmem_thr_copy_output.partition_D(cC);
+
+    // LDS will reuse the gmem_tiled_copy_output with uint4 for LDS.128
+    Tensor tSsLogit_copy_view = gmem_thr_copy_output.partition_S(sLogit);
+    Tensor tSrLogit_copy_view = make_fragment_like(tSsO_copy_view);
+    Tensor tSrExpLogits = make_fragment_like(tSrLogit_copy_view);
+
+    // (tileM, 1)
+    Tensor cLinear = make_identity_tensor(make_shape(size<0>(sLabels), size<1>(sLabels)));
+    // using LabelsCopyAtom = Copy_Atom<UniversalCopy<int64_t, int64_t>, int64_t>;
+    using LabelsCopyAtom = Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<int64_t>, int64_t>;
+    auto smem_tiled_copy_labels = make_tiled_copy(LabelsCopyAtom{},
+                                                  /*thr=*/Layout<Shape<Int<Traits::tileM>, Int<Traits::threads / Traits::tileM>>,
+                                                                 Stride<_1, Int<Traits::tileM>>>{},
+                                                  /*value=*/Layout<Shape<_1>>{});
+
+    static_assert(Traits::threads / Traits::tileM != 0, "threads must be divisible by tileM");
+    auto smem_thr_copy_labels = smem_tiled_copy_labels.get_thread_slice(threadIdx.x);
+    Tensor tSsLabels = smem_thr_copy_labels.partition_D(sLabels); // (CPY, CPY_M, CPY_N)
+    Tensor tSgLabels = smem_thr_copy_labels.partition_S(gLabels); // (CPY, CPY_M, CPY_N)
+    Tensor tScLinear = smem_thr_copy_labels.partition_S(cLinear); // (CPY, CPY_M, CPY_N)
+
+    #pragma unroll
+    for (int32_t m = 0; m < size<1>(tScLinear); ++m) {
+        #pragma unroll
+        for (int32_t n = 0; n < size<2>(tScLinear); ++n) {
+            if (get<0>(tScLinear(0, m, n)) < (num_tokens - pid_m * Traits::tileM)
+                && get<1>(tScLinear(0, m, n)) == 0) {
+                copy(smem_tiled_copy_labels,
+                    /*src=*/tSgLabels(_, m, n),
+                    /*dst=*/tSsLabels(_, m, n));
+                
+            }
+        }
+    }
+    cp_async_fence();
+
+#if 0
+    if (pid_m == 0 && pid_n == 0 && threadIdx.x == 0) {
+        print("tCcOutput layout: "); print(tCcOutput); print("\n");
+        print("tCcOutput(0, 0, 0): "); print(tCcOutput(0, 0, 0)); print("\n");
+        print("tCcOutput(1, 0, 0): "); print(tCcOutput(1, 0, 0)); print("\n");
+        print("tCcOutput(0, 1, 0): "); print(tCcOutput(0, 1, 0)); print("\n");
+        print("tSsO_copy_view layout: "); print(tSsO_copy_view); print("\n");
+        print("tCgC_copy_view layout: "); print(tCgC_copy_view); print("\n");
+    }
+#endif
+
+    float max_val[size<1>(tSrLogit_copy_view)] = {0.f};
+    float accumulate[size<1>(tSrLogit_copy_view)] = {0.f};
+    float entropy_b[size<1>(tSrLogit_copy_view)] = {0.f};
 
     int32_t n_tile_count = size<3>(tBgW);
     int32_t vocab_left_bound = pid_n * vocab_per_split;
@@ -479,26 +617,211 @@ __global__ void forward_mainloop_kernel(int32_t rank,
         } // iterate over k-tiles
 
         // epilogue on this n-tile
+        // ------- REG -> SMEM
+        copy(smem_tiled_copy_output,
+                /*src=*/tCrO_copy_view,
+                /*dst=*/tSsO);
+        __syncthreads();
+
     #if 1
-        // REG -> GMEM
         if (gmem_output_ptr != nullptr) {
+            // -------------- REG -> GMEM
+            // #pragma unroll
+            // for (int32_t k = 0; k < size<0>(tCcC); ++k) {
+            //     #pragma unroll
+            //     for (int32_t m = 0; m < size<1>(tCcC); ++m) {
+            //         #pragma unroll 
+            //         for (int32_t n = 0; n < size<2>(tCcC); ++n) {
+            //             if (get<0>(tCcC(k, m, n)) < num_tokens - pid_m * Traits::tileM
+            //                 && (vocab_left_bound + n_tile * Traits::tileN + get<1>(tCcC(k, m, n)) < vocab_right_bound)) {
+            //                 tCgC(k, m, n, n_tile) = tCrO(k, m, n);
+            //             }
+            //         }
+            //     }
+            // }
+
+            // SMEM -> GMEM
             #pragma unroll
-            for (int32_t k = 0; k < size<0>(tCcC); ++k) {
+            for (int32_t m = 0; m < size<1>(tCcOutput); ++m) {
                 #pragma unroll
-                for (int32_t m = 0; m < size<1>(tCcC); ++m) {
-                    #pragma unroll 
-                    for (int32_t n = 0; n < size<2>(tCcC); ++n) {
-                        if (get<0>(tCcC(k, m, n)) < num_tokens - pid_m * Traits::tileM
-                            && (vocab_left_bound + n_tile * Traits::tileN + get<1>(tCcC(k, m, n)) < vocab_right_bound)) {
-                            tCgC(k, m, n, n_tile) = tCrO(k, m, n);
-                        }
+                for (int32_t n = 0; n < size<2>(tCcOutput); ++n) {
+                    if (get<0>(tCcOutput(0, m, n)) < (num_tokens - pid_m * Traits::tileM)
+                        && (vocab_left_bound + n_tile * Traits::tileN + get<1>(tCcOutput(0, m, n)) < vocab_right_bound)) {
+                        copy(gmem_tiled_copy_output,
+                            /*src=*/tSsO_copy_view(_, m, n),
+                            /*dst=*/tCgC_copy_view(_, m, n, n_tile));
                     }
                 }
             }
         }
     #endif
 
+        // ----- SMEM -> LDS
+        copy(gmem_tiled_copy_output,
+             /*src=*/tSsLogit_copy_view,
+             /*dst=*/tSrLogit_copy_view);
+
+        // reduce-max & coefficient
+        auto valid = [&](int32_t k, int32_t m, int32_t n, int32_t pid_m) {
+            return (get<0>(tCcOutput(k, m, n)) < (num_tokens - pid_m * Traits::tileM)
+                    && (vocab_left_bound + n_tile * Traits::tileN + get<1>(tCcOutput(k, m, n)) < vocab_right_bound));
+        };
+    #if 0 // This branch will use current max_val for exp_logits
+        {
+            #pragma unroll
+            for (int32_t m = 0; m < size<1>(tSrLogit_copy_view); m++) {
+                float now_max = 0.f;
+                #pragma unroll
+                for (int32_t n = 0; n < size<2>(tSrLogit_copy_view); n++) {
+                    tSrLogit_copy_view(0, m, n) *= valid(0, m, n, pid_m);
+                    tSrLogit_copy_view(1, m, n) *= valid(1, m, n, pid_m);
+                    tSrLogit_copy_view(2, m, n) *= valid(2, m, n, pid_m);
+                    tSrLogit_copy_view(3, m, n) *= valid(3, m, n, pid_m);
+
+                    float2 max_temp;
+                    max_temp.x = fmaxf(tSrLogit_copy_view(0, m, n), tSrLogit_copy_view(1, m, n));
+                    max_temp.y = fmaxf(tSrLogit_copy_view(2, m, n), tSrLogit_copy_view(3, m, n));
+                    float warp_max = fmaxf(max_temp.x, max_temp.y);
+                    warp_max = cg::reduce(warp, warp_max, cg::greater<float>{});
+                    now_max = fmaxf(now_max, warp_max);
+                }
+                // update global max
+                float old_max = max_val[m];
+                max_val[m] = fmaxf(old_max, now_max);
+
+                float sum_exp_logits = 0.f;
+                float sum_exp_logits_mul_logits = 0.f;
+                #pragma unroll
+                for (int32_t n = 0; n < size<2>(tSrLogit_copy_view); n++) {
+                    float4 exp_logits;
+                    exp_logits.x = __expf(tSrLogit_copy_view(0, m, n) - max_val[m]);
+                    exp_logits.y = __expf(tSrLogit_copy_view(1, m, n) - max_val[m]);
+                    exp_logits.z = __expf(tSrLogit_copy_view(2, m, n) - max_val[m]);
+                    exp_logits.w = __expf(tSrLogit_copy_view(3, m, n) - max_val[m]);
+
+                    float2 sum_temp;
+                    sum_temp.x = __fadd_rn(exp_logits.x, exp_logits.y);
+                    sum_temp.y = __fadd_rn(exp_logits.z, exp_logits.w);
+                    float warp_sum = __fadd_rn(sum_temp.x, sum_temp.y);
+                    warp_sum = cg::reduce(warp, warp_sum, cg::plus<float>{});
+                    sum_exp_logits = __fadd_rn(sum_exp_logits, warp_sum);
+
+                    sum_temp.x = __fadd_rn(tSrLogit_copy_view(0, m, n) * exp_logits.x,
+                                           tSrLogit_copy_view(1, m, n) * exp_logits.y);
+                    sum_temp.y = __fadd_rn(tSrLogit_copy_view(2, m, n) * exp_logits.z,
+                                           tSrLogit_copy_view(3, m, n) * exp_logits.w);
+                    warp_sum = __fadd_rn(sum_temp.x, sum_temp.y);
+                    warp_sum = cg::reduce(warp, warp_sum, cg::plus<float>{});
+                    sum_exp_logits_mul_logits = __fadd_rn(sum_exp_logits_mul_logits, warp_sum);
+
+                    // logprobs
+                    #pragma unroll
+                    for (int32_t k = 0; k < size<0>(tSrLogit_copy_view); k++) {
+                        int64_t current_n_idx = rank * vocab_size 
+                                                + pid_n * vocab_per_split 
+                                                + n_tile * Traits::tileN 
+                                                + get<1>(tCcOutput(k, m, n));
+                        int64_t m_idx = get<0>(tCcOutput(k, m, n));
+                        if (m_idx < (num_tokens - pid_m * Traits::tileM)
+                            && sLabels(m_idx, Int<0>{}) == current_n_idx) {
+                            gLogprobs(m_idx, Int<0>{}) = tSrLogit_copy_view(k, m, n);
+                        }
+                    }
+                }
+
+                float coefficient = __expf(old_max - max_val[m]);
+
+                accumulate[m] = __fmaf_ieee_rn(coefficient, accumulate[m], sum_exp_logits);
+                entropy_b[m] = __fmaf_ieee_rn(entropy_b[m], coefficient, sum_exp_logits_mul_logits);
+            }
+        }
+    #else // this branch will use previous max_val for exp_logits
+        {
+            #pragma unroll
+            for (int32_t m = 0; m < size<1>(tSrLogit_copy_view); m++) {
+                float now_max = 0.f;
+                float coefficient = 0.f;
+                float sum_exp_logits = 0.f;
+                float sum_exp_logits_mul_logits = 0.f;
+                #pragma unroll
+                for (int32_t n = 0; n < size<2>(tSrLogit_copy_view); n++) {
+                    tSrLogit_copy_view(0, m, n) *= valid(0, m, n, pid_m);
+                    tSrLogit_copy_view(1, m, n) *= valid(1, m, n, pid_m);
+                    tSrLogit_copy_view(2, m, n) *= valid(2, m, n, pid_m);
+                    tSrLogit_copy_view(3, m, n) *= valid(3, m, n, pid_m);
+
+                    float2 max_temp;
+                    max_temp.x = fmaxf(tSrLogit_copy_view(0, m, n), tSrLogit_copy_view(1, m, n));
+                    max_temp.y = fmaxf(tSrLogit_copy_view(2, m, n), tSrLogit_copy_view(3, m, n));
+                    float warp_max = fmaxf(max_temp.x, max_temp.y);
+                    warp_max = cg::reduce(warp, warp_max, cg::greater<float>{});
+                    now_max = fmaxf(now_max, warp_max);
+
+                    float4 exp_logits;
+                    exp_logits.x = __expf(tSrLogit_copy_view(0, m, n) - max_val[m]);
+                    exp_logits.y = __expf(tSrLogit_copy_view(1, m, n) - max_val[m]);
+                    exp_logits.z = __expf(tSrLogit_copy_view(2, m, n) - max_val[m]);
+                    exp_logits.w = __expf(tSrLogit_copy_view(3, m, n) - max_val[m]);
+
+                    float2 sum_temp;
+                    sum_temp.x = __fadd_rn(exp_logits.x, exp_logits.y);
+                    sum_temp.y = __fadd_rn(exp_logits.z, exp_logits.w);
+                    float warp_sum = __fadd_rn(sum_temp.x, sum_temp.y);
+                    warp_sum = cg::reduce(warp, warp_sum, cg::plus<float>{});
+                    sum_exp_logits = __fadd_rn(sum_exp_logits, warp_sum);
+
+                    sum_temp.x = __fadd_rn(tSrLogit_copy_view(0, m, n) * exp_logits.x,
+                                           tSrLogit_copy_view(1, m, n) * exp_logits.y);
+                    sum_temp.y = __fadd_rn(tSrLogit_copy_view(2, m, n) * exp_logits.z,
+                                           tSrLogit_copy_view(3, m, n) * exp_logits.w);
+                    warp_sum = __fadd_rn(sum_temp.x, sum_temp.y);
+                    warp_sum = cg::reduce(warp, warp_sum, cg::plus<float>{});
+                    sum_exp_logits_mul_logits = __fadd_rn(sum_exp_logits_mul_logits, warp_sum);
+
+                    // logprobs
+                    #pragma unroll
+                    for (int32_t k = 0; k < size<0>(tSrLogit_copy_view); k++) {
+                        int64_t current_n_idx = rank * vocab_size 
+                                                + pid_n * vocab_per_split 
+                                                + n_tile * Traits::tileN 
+                                                + get<1>(tCcOutput(k, m, n));
+                        int64_t m_idx = get<0>(tCcOutput(k, m, n));
+                        if (m_idx < (num_tokens - pid_m * Traits::tileM)
+                            && sLabels(m_idx, Int<0>{}) == current_n_idx) {
+                            gLogprobs(m_idx, Int<0>{}) = tSrLogit_copy_view(k, m, n);
+                        }
+                    }
+                }
+
+                float old_max = max_val[m];
+                max_val[m] = fmaxf(old_max, now_max);
+
+                coefficient = __expf(old_max - max_val[m]);
+
+                sum_exp_logits *= coefficient;
+                accumulate[m] = __fmaf_ieee_rn(coefficient, accumulate[m], sum_exp_logits);
+
+                sum_exp_logits_mul_logits *= coefficient;
+                entropy_b[m] = __fmaf_ieee_rn(entropy_b[m], coefficient, sum_exp_logits_mul_logits);
+            }
+        }
+    #endif
     } // n_tile
+    {
+        {
+            if (warp.thread_rank() == 0) {
+                #pragma unroll
+                for (int32_t m = 0; m < size<1>(tSrLogit_copy_view); m++) {
+                    int32_t m_idx = get<0>(tCcOutput(0, m, 0));
+                    if (m_idx < (num_tokens - pid_m * Traits::tileM)) {
+                        gMax(m_idx, Int<0>{}) = max_val[m];
+                        gAcc(m_idx, Int<0>{}) = accumulate[m];
+                        gEntropyB(m_idx, Int<0>{}) = entropy_b[m];
+                    }
+                }
+            }
+        }
+    }
 }
 
 } // namespace lce

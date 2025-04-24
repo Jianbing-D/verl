@@ -43,29 +43,69 @@ class TestLinearCrossEntropyCUTE:
         end = torch.cuda.Event(enable_timing=True)
 
         hidden, weight, labels = self.generate_forward_inputs()
+        print(labels.dtype)
 
         # torch implementation
         start.record()
-        logits = torch.matmul(hidden, weight.T)
+        logits = torch.matmul(hidden, weight.T).to(torch.float32)
         end.record()
         torch.cuda.synchronize()
         print(f"torch forward time: {start.elapsed_time(end)} ms")
+
+        vocab_per_split = 1024
+        # vocab_per_split = self.vocab_size
+        num_splits = (self.vocab_size + vocab_per_split - 1) // vocab_per_split
+
+        # Pad logits with zeros to make it divisible by vocab_per_split
+        padded_size = num_splits * vocab_per_split
+        if padded_size > self.vocab_size:
+            padding = torch.zeros((self.num_tokens, padded_size - self.vocab_size), 
+                                 dtype=logits.dtype, device=logits.device)
+            padded_logits = torch.cat([logits, padding], dim=1)
+        else:
+            padded_logits = logits
+        # Reshape padded logits to [num_tokens, num_splits, vocab_per_split]
+        reshaped_logits = padded_logits.view(self.num_tokens, num_splits, vocab_per_split)
+        
+        # Max over the vocab_per_split dimension for each split
+        split_max = torch.max(reshaped_logits, dim=2)[0]  # [num_tokens, num_splits]
+        
+        # Extract values from logits based on labels
+        torch_logprobs = logits[torch.arange(self.num_tokens, device="cuda"), labels]
+        
+        # Reshape split_max for broadcasting - keep split dimension separate
+        max_expanded = split_max.unsqueeze(2)  # [num_tokens, num_splits, 1]
+        
+        # Calculate exp(logits - max) with the reshaped tensor, using per-split max values
+        exp_logits_reshaped = torch.exp(reshaped_logits - max_expanded)
+        
+        # Sum over vocab_per_split dimension for each split
+        torch_accu = exp_logits_reshaped.sum(dim=2)  # [num_tokens, num_splits]
+        
+        # Calculate entropy_b using the reshaped tensors
+        torch_entropy_b = (reshaped_logits * exp_logits_reshaped).sum(dim=2)  # [num_tokens, num_splits]
+        
+        # Reshape exp_logits back to original shape for compatibility with rest of code
+        # Need to handle the padding when reshaping back to original size
+        exp_logits = exp_logits_reshaped.view(self.num_tokens, padded_size)
+        if padded_size > self.vocab_size:
+            exp_logits = exp_logits[:, :self.vocab_size]  # Remove the padding
+
+        rank = 0
         
         # cute implementation
-        _max = torch.empty((self.num_tokens, 1), dtype=self.dtype, device="cuda")
-        _acc = torch.empty((self.num_tokens, 1), dtype=self.dtype, device="cuda")
-        _entropy_b = torch.empty((self.num_tokens, 1), dtype=self.dtype, device="cuda")
-        final_logprobs = torch.empty(self.num_tokens, dtype=self.dtype, device="cuda")
-        final_logprobs_scalar = torch.empty(1, dtype=self.dtype, device="cuda")
+        _max = torch.empty((self.num_tokens, num_splits), dtype=torch.float32, device="cuda")
+        _acc = torch.empty((self.num_tokens, num_splits), dtype=torch.float32, device="cuda")
+        _entropy_b = torch.empty((self.num_tokens, num_splits), dtype=torch.float32, device="cuda")
+        final_logprobs = torch.empty(self.num_tokens, dtype=torch.float32, device="cuda")
+        final_logprobs_scalar = torch.empty((), dtype=torch.float32, device="cuda")
 
         gmem_output = torch.empty((self.num_tokens, self.vocab_size), dtype=torch.float, device="cuda")
 
         start.record()
-        rank = 0
-        vocab_per_split = 1024
         with torch.cuda.nvtx.range("forward_mainloop"):
             lce_ext.forward_mainloop(hidden, hidden.stride(0), hidden.stride(1),
-                                    weight, weight.stride(1), weight.stride(0),
+                                    weight, weight.stride(0), weight.stride(1),
                                     labels, labels.stride(0),
                                     rank, 
                                     self.num_tokens, self.vocab_size, self.hidden_size,
@@ -85,11 +125,42 @@ class TestLinearCrossEntropyCUTE:
         print("torch logits")
         print(logits)
 
-        torch.testing.assert_close(gmem_output, logits.to(torch.float),
+        # Find the maximum absolute difference
+        logits_float = logits.to(torch.float)
+        abs_diff = (gmem_output - logits_float).abs()
+        max_diff_value = abs_diff.max().item()
+        max_diff_indices = (abs_diff == max_diff_value).nonzero()[0]
+        i, j = max_diff_indices
+        
+        print(f"Maximum absolute difference: {max_diff_value}")
+        print(f"At position: [{i}, {j}]")
+        print(f"CUTE value: {gmem_output[i, j].item()}")
+        print(f"PyTorch value: {logits_float[i, j].item()}")
+        
+        torch.testing.assert_close(gmem_output, logits_float,
                                    atol=1e-2, rtol=1e-2)
+
+        print("torch max:")
+        print(split_max)
+        print("cute max:")
+        print(_max)
+        print("torch logprobs:")
+        print(torch_logprobs)
+        print("cute logprobs:")
+        print(final_logprobs)
+        print("torch accu:")
+        print(torch_accu)
+        print("cute accu:")
+        print(_acc)
+        print("torch entropy_b:")
+        print(torch_entropy_b)
+        print("cute entropy_b:")
+        print(_entropy_b)
 
 
 if __name__ == "__main__":
+    torch.manual_seed(233376)
+
     test = TestLinearCrossEntropyCUTE()
     test.verify_correctness()
         

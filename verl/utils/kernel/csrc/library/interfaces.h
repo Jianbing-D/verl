@@ -28,13 +28,15 @@ namespace lce {
 template <typename InT, typename OutT>
 void forward_mainloop(int32_t rank,
                       void *hidden_ptr,
-                      int32_t stride_hidden_m, int32_t stride_hidden_k,
                       void *weight_ptr,
-                      int32_t stride_weight_n, int32_t stride_weight_k,
-                      uint64_t *labels_ptr,
+                      int64_t *labels_ptr,
                       int32_t num_tokens,
                       int32_t vocab_size,
                       int32_t vocab_per_split,
+                      void *max_ptr,
+                      void *acc_ptr,
+                      void *entropy_b_ptr,
+                      void *logprobs_ptr,
                       float *gmem_output_ptr,
                       cudaStream_t stream);
 
