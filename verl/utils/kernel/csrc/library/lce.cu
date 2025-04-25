@@ -118,7 +118,11 @@ void backward_d_logits<__nv_bfloat16, __nv_bfloat16>(int32_t num_tokens,
                                                     __nv_bfloat16 *grad_logits_ptr,
                                                     float *gmem_output_ptr,
                                                     cudaStream_t stream) {
-    using Traits = lce::Traits<__nv_bfloat16, __nv_bfloat16, 4096>;
+    using Traits = lce::Traits<__nv_bfloat16, __nv_bfloat16, 4096,
+                               lce::_3DLayout<4, 2, 1>,
+                               /*tileM*/128,
+                               /*tileN*/128,
+                               /*threadBlockSwizzleSize*/4>;
 
     int32_t num_blocks_m = (num_tokens + Traits::tileM - 1) / Traits::tileM;
     int32_t num_blocks_n = (vocab_size + Traits::tileN - 1) / Traits::tileN;
@@ -133,9 +137,15 @@ void backward_d_logits<__nv_bfloat16, __nv_bfloat16>(int32_t num_tokens,
     dim3 grid(num_blocks, 1, 1);
 
     auto kernel = lce::backward_d_logits_kernel<Traits>;
-
     size_t smem_bytes = std::max(Traits::smem_hidden_bytes + Traits::smem_weight_bytes,
-                                 Traits::smem_logit_bytes);
+                                 Traits::smem_logit_bytes)
+                        + Traits::smem_labels_bytes
+                        + Traits::smem_accumulate_bytes
+                        + Traits::smem_maximum_bytes
+                        + Traits::smem_entropy_b_bytes
+                        + Traits::smem_grad_entropy_bytes
+                        + Traits::smem_grad_logprobs_bytes
+                        + 1024;
     if (smem_bytes >= 48 * 1024ul) {
         CUDA_THROW(cudaFuncSetAttribute(kernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,

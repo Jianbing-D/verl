@@ -150,19 +150,34 @@ class TestLinearCrossEntropyCUTE:
                                    atol=1e-1, rtol=1e-1)
         torch.testing.assert_close(torch_entropy_b, _entropy_b,
                                    atol=1e-1, rtol=1e-1)
-        print("forward path correctness verified")
+        print("forward path correctness verified\n")
 
 
-        # ------------ backward ------------
-        print("")
-        maximum = torch.empty((self.num_tokens), dtype=torch.float32, device="cuda")
-        accumulate = torch.empty((self.num_tokens), dtype=torch.float32, device="cuda")
-        entropy_b = torch.empty((self.num_tokens), dtype=torch.float32, device="cuda")
-        grad_entropy = torch.empty((self.num_tokens), dtype=torch.float32, device="cuda")
-        grad_logprobs = torch.empty((self.num_tokens), dtype=torch.float32, device="cuda")
+    def verify_backward_correctness(self, iterations=5):
+        self.cleanup()
+        self.generate_hyper()
+
+        hidden, weight, labels = self.generate_forward_inputs()
+        logits = torch.matmul(hidden, weight.T).to(torch.float32)
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        rank = 0
+
+        maximum = logits.max(dim=1)[0]
+        exp_logits = torch.exp(logits - maximum.unsqueeze(1))
+        accumulate = exp_logits.sum(dim=1)
+        pd = torch.nn.functional.softmax(logits, dim=1)
+        entropy_b = torch.sum(pd * logits, dim=-1)
+        logprobs = torch.nn.functional.cross_entropy(logits, labels, reduction="none")
+        logprobs = torch.neg(logprobs)
+        grad_entropy = torch.randn((self.num_tokens), dtype=torch.float32, device="cuda")
+        grad_logprobs = torch.randn((self.num_tokens), dtype=torch.float32, device="cuda")
         grad_logits = torch.empty((self.num_tokens, self.vocab_size), dtype=self.dtype, device="cuda")
 
-        gmem_output = torch.empty((self.num_tokens, self.vocab_size), dtype=torch.float32, device="cuda")
+        # gmem_output = torch.empty((self.num_tokens, self.vocab_size), dtype=torch.float32, device="cuda")
+        gmem_output = None
 
         start.record()
         with torch.cuda.nvtx.range("backward_d_logits"):
@@ -191,6 +206,44 @@ class TestLinearCrossEntropyCUTE:
             torch.testing.assert_close(gmem_output, logits,
                                        atol=1e-2, rtol=1e-2)
             
+        exp_logits = torch.exp(logits - maximum.unsqueeze(1))
+        
+        # Create mask where labels match the vocabulary indices
+        vocab_indices = torch.arange(self.vocab_size, device="cuda")
+        vocab_indices = vocab_indices + rank * self.vocab_size
+        mask = (labels.unsqueeze(1) == vocab_indices.unsqueeze(0)).to(torch.float32)
+        
+        # Calculate reciprocal of accumulate for division
+        accu_rcp = 1.0 / accumulate
+        
+        # Calculate d_logits according to the formula
+        torch_d_logits = grad_logprobs.unsqueeze(1) * (exp_logits * accu_rcp.unsqueeze(1) - mask)
+        torch_d_logits += grad_entropy.unsqueeze(1) * (-1.0 * exp_logits * accu_rcp.unsqueeze(1)) * (logits - entropy_b.unsqueeze(1))
+        
+        # Convert to the same dtype as grad_logits for comparison
+        torch_d_logits = torch_d_logits.to(grad_logits.dtype)
+
+        # Find the maximum absolute difference between torch_d_logits and grad_logits
+        abs_diff = torch.abs(torch_d_logits - grad_logits)
+        max_abs_diff = torch.max(abs_diff).item()
+        max_diff_indices = (abs_diff == max_abs_diff).nonzero()[0]
+        i, j = max_diff_indices
+        
+        print(f"Maximum absolute difference: {max_abs_diff}")
+        print(f"At position: [{i}, {j}]")
+        print(f"CUTE value: {torch_d_logits[i, j].item()}")
+        print(f"PyTorch value: {grad_logits[i, j].item()}")
+
+        print("torch_d_logits")
+        print(torch_d_logits)
+        print("grad_logits")
+        print(grad_logits)
+        
+        # Verify correctness of gradient computation
+        torch.testing.assert_close(torch_d_logits, grad_logits, 
+                                  atol=1e-2, rtol=1e-2)
+        print("backward path correctness verified")
+        
             
 
 if __name__ == "__main__":
@@ -198,4 +251,4 @@ if __name__ == "__main__":
 
     test = TestLinearCrossEntropyCUTE()
     test.verify_correctness()
-        
+    test.verify_backward_correctness()

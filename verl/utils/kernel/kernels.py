@@ -99,6 +99,7 @@ class BackwardEnum:
 
 
 _BACKWARD: BackwardEnum = BackwardEnum._Total_Separate
+_USE_TRITON: bool = False
 
 
 def set_backward_method(backward_method: BackwardEnum):
@@ -464,8 +465,7 @@ def efficient_entropy_forward(
     assert _accu.is_contiguous() and _entropy_b.is_contiguous() and _max.is_contiguous()
     assert _accu.is_cuda and _entropy_b.is_cuda and _max.is_cuda
 
-    use_triton = False
-    if use_triton:
+    if _USE_TRITON:
         # 1D kernel launch, then split the tile
         def mainloop_grid(meta):
             return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]) * num_splits,)
@@ -817,7 +817,6 @@ def efficient_entropy_backward(
     assert entropy_b.shape == (num_tokens,)
 
     if _BACKWARD == BackwardEnum._Total_Fuse_MN:
-
         def mainloop_grid(meta):
             return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]) * triton.cdiv(vocab_size, meta["BLOCK_SIZE_N"]),)
 
@@ -855,6 +854,7 @@ def efficient_entropy_backward(
     elif _BACKWARD == BackwardEnum._Total_Separate:
         _d_logits = torch.empty((num_tokens, vocab_size), device=hidden.device, dtype=hidden.dtype)
 
+        # if _USE_TRITON:
         def d_logits_grid(meta):
             return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]) * triton.cdiv(vocab_size, meta["BLOCK_SIZE_N"]),)
 
@@ -886,6 +886,28 @@ def efficient_entropy_backward(
             _d_logits.stride(0),
             _d_logits.stride(1),
         )
+
+        print(_d_logits)
+        _d_logits = torch.empty((num_tokens, vocab_size), device=hidden.device, dtype=hidden.dtype)
+
+        # else:
+        _weight = weight.T.contiguous()
+        lce_ext.backward_d_logits(
+            num_tokens, hidden_size, vocab_size, _rank,
+            hidden, hidden.stride(0), hidden.stride(1),
+            _weight, _weight.stride(0), _weight.stride(1),
+            labels, labels.stride(0),
+            maximum, maximum.stride(0),
+            acc, acc.stride(0),
+            entropy_b, entropy_b.stride(0),
+            dentropy, dentropy.stride(0),
+            dlogprobs, dlogprobs.stride(0),
+            _d_logits, _d_logits.stride(0), _d_logits.stride(1),
+            None,
+        )
+
+        print(_d_logits)
+        exit()
 
         torch.matmul(_d_logits, weight.T, out=d_hidden)
         torch.matmul(hidden.T, _d_logits, out=d_weight)

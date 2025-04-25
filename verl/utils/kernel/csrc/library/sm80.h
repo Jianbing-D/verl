@@ -124,6 +124,13 @@ struct Traits {
                                         + smem_logit_bytes
                                         + smem_labels_bytes
                                         + 1024; // additional 1024 bytes for alignment
+
+    // maybe used in backward
+    static constexpr size_t smem_accumulate_bytes = sizeof(float) * size(SmemLinearLayout{});
+    static constexpr size_t smem_maximum_bytes = sizeof(float) * size(SmemLinearLayout{});
+    static constexpr size_t smem_entropy_b_bytes = sizeof(float) * size(SmemLinearLayout{});
+    static constexpr size_t smem_grad_entropy_bytes = sizeof(float) * size(SmemLinearLayout{});
+    static constexpr size_t smem_grad_logprobs_bytes = sizeof(float) * size(SmemLinearLayout{});
 };
 
 
@@ -351,7 +358,6 @@ __global__ void forward_mainloop_kernel(int32_t rank,
     // LDS will reuse the gmem_tiled_copy_output with uint4 for LDS.128
     Tensor tSsLogit_copy_view = gmem_thr_copy_output.partition_S(sLogit);
     Tensor tSrLogit_copy_view = make_fragment_like(tSsO_copy_view);
-    Tensor tSrExpLogits = make_fragment_like(tSrLogit_copy_view);
 
     // (tileM, 1)
     Tensor cLinear = make_identity_tensor(make_shape(size<0>(sLabels), size<1>(sLabels)));
@@ -770,10 +776,23 @@ __global__ void backward_d_logits_kernel(int32_t num_tokens,
                                 Shape<Int<Traits::tileN>, Int<Traits::tileK>>{},
                                 make_coord(pid_n, _)); 
     // (tileM, tileK, pipe)
-    Tensor sHidden = make_tensor(make_smem_ptr(reinterpret_cast<typename Traits::IN_DTYPE*>(smem_aligned)),
+    Tensor sHidden = make_tensor(make_smem_ptr(reinterpret_cast<typename Traits::IN_DTYPE*>(smem_aligned
+                                    + Traits::smem_labels_bytes
+                                    + Traits::smem_accumulate_bytes
+                                    + Traits::smem_maximum_bytes
+                                    + Traits::smem_entropy_b_bytes
+                                    + Traits::smem_grad_entropy_bytes
+                                    + Traits::smem_grad_logprobs_bytes)),
                                  typename Traits::SmemLayoutHidden{});
+
     // (tileN, tileK, pipe)
     Tensor sWeight = make_tensor(make_smem_ptr(reinterpret_cast<typename Traits::IN_DTYPE*>(smem_aligned
+                                        + Traits::smem_labels_bytes
+                                        + Traits::smem_accumulate_bytes
+                                        + Traits::smem_maximum_bytes
+                                        + Traits::smem_entropy_b_bytes
+                                        + Traits::smem_grad_entropy_bytes
+                                        + Traits::smem_grad_logprobs_bytes
                                         + Traits::smem_hidden_bytes)),
                                  typename Traits::SmemLayoutWeight{});
 #if 1
@@ -787,8 +806,163 @@ __global__ void backward_d_logits_kernel(int32_t num_tokens,
                                 make_coord(pid_m, pid_n));
 #endif
     // (tileM, tileN)
-    Tensor sLogit = make_tensor(make_smem_ptr(reinterpret_cast<float*>(smem_aligned)),
+    Tensor sLogit = make_tensor(make_smem_ptr(reinterpret_cast<float*>(smem_aligned
+                                        + Traits::smem_labels_bytes
+                                        + Traits::smem_accumulate_bytes
+                                        + Traits::smem_maximum_bytes
+                                        + Traits::smem_entropy_b_bytes
+                                        + Traits::smem_grad_entropy_bytes
+                                        + Traits::smem_grad_logprobs_bytes)),
                                 typename Traits::SmemLayoutLogit{});
+    Tensor sLogit_bf16 = make_tensor(make_smem_ptr(reinterpret_cast<typename Traits::OUT_DTYPE*>(smem_aligned
+                                        + Traits::smem_labels_bytes
+                                        + Traits::smem_accumulate_bytes
+                                        + Traits::smem_maximum_bytes
+                                        + Traits::smem_entropy_b_bytes
+                                        + Traits::smem_grad_entropy_bytes
+                                        + Traits::smem_grad_logprobs_bytes)),
+                                 typename Traits::SmemLayoutLogit{});
+
+    // (num_tokens, 1)
+    Tensor mLabels = make_tensor(make_gmem_ptr(reinterpret_cast<int64_t*>(labels_ptr)),
+                                 make_shape(num_tokens, Int<1>{}));
+    // (tileM, 1)
+    Tensor gLabels = local_tile(mLabels,
+                                Shape<Int<Traits::tileM>, _1>{},
+                                make_coord(pid_m, _0{}));
+    // (tileM, 1)
+    Tensor sLabels = make_tensor(make_smem_ptr(reinterpret_cast<int64_t*>(smem_aligned)),
+                                 typename Traits::SmemLinearLayout{});
+
+    // (num_tokens, 1)
+    Tensor mAccumulate = make_tensor(make_gmem_ptr(reinterpret_cast<float*>(accumulate_ptr)),
+                                     make_shape(num_tokens, Int<1>{}));
+    Tensor gAccumulate = local_tile(mAccumulate,
+                                    Shape<Int<Traits::tileM>, _1>{},
+                                    make_coord(pid_m, _0{}));
+    Tensor sAccumulate = make_tensor(make_smem_ptr(reinterpret_cast<float*>(smem_aligned
+                                        + Traits::smem_labels_bytes)),
+                                     typename Traits::SmemLinearLayout{});
+
+    // (num_tokens, 1)
+    Tensor mMaximum = make_tensor(make_gmem_ptr(reinterpret_cast<float*>(maximum_ptr)),
+                                  make_shape(num_tokens, Int<1>{}));
+    Tensor gMaximum = local_tile(mMaximum,
+                                 Shape<Int<Traits::tileM>, _1>{},
+                                 make_coord(pid_m, _0{}));
+    Tensor sMaximum = make_tensor(make_smem_ptr(reinterpret_cast<float*>(smem_aligned
+                                        + Traits::smem_labels_bytes
+                                        + Traits::smem_accumulate_bytes)),
+                                  typename Traits::SmemLinearLayout{});
+
+
+    // (num_tokens, 1)
+    Tensor mEntropyB = make_tensor(make_gmem_ptr(reinterpret_cast<float*>(entropy_b_ptr)),
+                                   make_shape(num_tokens, Int<1>{}));
+    Tensor gEntropyB = local_tile(mEntropyB,
+                                  Shape<Int<Traits::tileM>, _1>{},
+                                  make_coord(pid_m, _0{}));
+    Tensor sEntropyB = make_tensor(make_smem_ptr(reinterpret_cast<float*>(smem_aligned
+                                        + Traits::smem_labels_bytes
+                                        + Traits::smem_accumulate_bytes
+                                        + Traits::smem_maximum_bytes)),
+                                  typename Traits::SmemLinearLayout{});
+
+    // (num_tokens, 1)
+    Tensor mGradEntropy = make_tensor(make_gmem_ptr(reinterpret_cast<float*>(grad_entropy_ptr)),
+                                     make_shape(num_tokens, Int<1>{}));
+    Tensor gGradEntropy = local_tile(mGradEntropy,
+                                    Shape<Int<Traits::tileM>, _1>{},
+                                    make_coord(pid_m, _0{}));
+    Tensor sGradEntropy = make_tensor(make_smem_ptr(reinterpret_cast<float*>(smem_aligned
+                                        + Traits::smem_labels_bytes
+                                        + Traits::smem_accumulate_bytes
+                                        + Traits::smem_maximum_bytes
+                                        + Traits::smem_entropy_b_bytes)),
+                                  typename Traits::SmemLinearLayout{});
+
+    // (num_tokens, 1)
+    Tensor mGradLogprobs = make_tensor(make_gmem_ptr(reinterpret_cast<float*>(grad_logprobs_ptr)),
+                                      make_shape(num_tokens, Int<1>{}));
+    Tensor gGradLogprobs = local_tile(mGradLogprobs,
+                                      Shape<Int<Traits::tileM>, _1>{},
+                                      make_coord(pid_m, _0{}));
+    Tensor sGradLogprobs = make_tensor(make_smem_ptr(reinterpret_cast<float*>(smem_aligned
+                                        + Traits::smem_labels_bytes
+                                        + Traits::smem_accumulate_bytes
+                                        + Traits::smem_maximum_bytes
+                                        + Traits::smem_entropy_b_bytes
+                                        + Traits::smem_grad_entropy_bytes)),
+                                  typename Traits::SmemLinearLayout{});
+
+    // (num_tokens, vocab_size)
+    Tensor mGradLogits = make_tensor(make_gmem_ptr(reinterpret_cast<typename Traits::OUT_DTYPE*>(grad_logits_ptr)),
+                                     make_shape(num_tokens, vocab_size),
+                                     make_stride(vocab_size, _1{}));
+    // (tileM, tileN)
+    Tensor gGradLogits = local_tile(mGradLogits,
+                                    Shape<Int<Traits::tileM>, Int<Traits::tileN>>{},
+                                    make_coord(pid_m, pid_n));
+                                    
+    // lienar GMEM -> SMEM
+    Tensor cLinear = make_identity_tensor(make_shape(size<0>(sLabels), size<0>(sLabels)));
+    using LinearInt64CopyAtom = Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<int64_t>, int64_t>;
+    using LinearFP32CopyAtom = Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<float>, float>;
+    using LinearCopyThrLayout = Layout<Shape<Int<Traits::tileM>, Int<Traits::threads / Traits::tileM>>,
+                                       Stride<_1, Int<Traits::tileM>>>;
+    using LinearCopyValLayout = Layout<Shape<_1>>;
+    static_assert(Traits::threads > Traits::tileM, "threads must be greater than tileM");
+    auto smem_linear_copy_labels = make_tiled_copy(LinearInt64CopyAtom{},
+                                                   /*thr=*/LinearCopyThrLayout{},
+                                                   /*value=*/LinearCopyValLayout{});
+    auto smem_linear_copy_fp32 = make_tiled_copy(LinearFP32CopyAtom{},
+                                                 /*thr=*/LinearCopyThrLayout{},
+                                                 /*value=*/LinearCopyValLayout{});
+    auto smem_linear_thr_labels = smem_linear_copy_labels.get_slice(threadIdx.x);
+    auto smem_linear_thr_fp32 = smem_linear_copy_fp32.get_slice(threadIdx.x);
+    Tensor tG2ScLinear = smem_linear_thr_fp32.partition_S(cLinear);
+    Tensor tG2SsLabels = smem_linear_thr_labels.partition_D(sLabels);
+    Tensor tG2SgLabels = smem_linear_thr_labels.partition_S(gLabels);
+    Tensor tG2SsMaximum = smem_linear_thr_fp32.partition_D(sMaximum);
+    Tensor tG2SgMaximum = smem_linear_thr_fp32.partition_S(gMaximum);
+    Tensor tG2SsAccumulate = smem_linear_thr_fp32.partition_D(sAccumulate);
+    Tensor tG2SgAccumulate = smem_linear_thr_fp32.partition_S(gAccumulate);
+    Tensor tG2SsEntropyB = smem_linear_thr_fp32.partition_D(sEntropyB);
+    Tensor tG2SgEntropyB = smem_linear_thr_fp32.partition_S(gEntropyB);
+    Tensor tG2SsGradEntropy = smem_linear_thr_fp32.partition_D(sGradEntropy);
+    Tensor tG2SgGradEntropy = smem_linear_thr_fp32.partition_S(gGradEntropy);
+    Tensor tG2SsGradLogprobs = smem_linear_thr_fp32.partition_D(sGradLogprobs);
+    Tensor tG2SgGradLogprobs = smem_linear_thr_fp32.partition_S(gGradLogprobs);
+
+    #pragma unroll
+    for (int32_t m = 0; m < size<1>(tG2ScLinear); ++m) {
+        #pragma unroll
+        for (int32_t n = 0; n < size<2>(tG2ScLinear); ++n) {
+            if (get<0>(tG2ScLinear(0, m, n)) < (num_tokens - pid_m * Traits::tileM)
+                && get<1>(tG2ScLinear(0, m, n)) < 1) {
+                copy(smem_linear_copy_labels,
+                     /*src=*/tG2SgLabels(_, m, n),
+                     /*dst=*/tG2SsLabels(_, m, n));
+                copy(smem_linear_copy_fp32,
+                     tG2SgMaximum(_, m, n),
+                     tG2SsMaximum(_, m, n));
+                copy(smem_linear_copy_fp32,
+                     tG2SgAccumulate(_, m, n),
+                     tG2SsAccumulate(_, m, n));
+                copy(smem_linear_copy_fp32,
+                     tG2SgEntropyB(_, m, n),
+                     tG2SsEntropyB(_, m, n));
+                copy(smem_linear_copy_fp32,
+                     tG2SgGradEntropy(_, m, n),
+                     tG2SsGradEntropy(_, m, n));
+                copy(smem_linear_copy_fp32,
+                     tG2SgGradLogprobs(_, m, n),
+                     tG2SsGradLogprobs(_, m, n));
+            }
+        }
+    }
+    cp_async_fence();
+                                    
 
     // GMEM -> SMEM
     typename Traits::TiledCopy gmem_tiled_copy_hidden;
@@ -832,6 +1006,8 @@ __global__ void backward_d_logits_kernel(int32_t num_tokens,
     Tensor tMMArH = thr_mma.make_fragment_A(tMMAsH(_, _, _, Int<0>{}));
     // (MMA, MMA_N, MMA_K)
     Tensor tMMArW = thr_mma.make_fragment_B(tMMAsW(_, _, _, Int<0>{}));
+    // (MMA, MMA_M, MMA_N)
+    Tensor tMMArLogit_outT = make_fragment_like<typename Traits::OUT_DTYPE>(tMMArLogit);
     
     // SMEM -> REG
     auto smem_tiled_copy_hidden = typename Traits::TiledLDSM_A{};
@@ -844,28 +1020,50 @@ __global__ void backward_d_logits_kernel(int32_t num_tokens,
     Tensor tS2RsW = smem_thr_copy_weight.partition_S(sWeight); // (CPY, CPY_N, CPY_K, pipe)
     Tensor tS2RrW_view = smem_thr_copy_weight.retile_D(tMMArW); // (CPY, CPY_N, CPY_K)
 
-    // REG -> SMEM for float32
+    // REG -> SMEM for float32 2 consecutive elements
     auto smem_tiled_copy_logit = make_tiled_copy_C(Copy_Atom<UniversalCopy<uint64_t, uint64_t>, float>{},
                                                    tiled_mma);
     auto smem_thr_copy_logit = smem_tiled_copy_logit.get_slice(threadIdx.x);
     Tensor tR2SsLogit = smem_thr_copy_logit.partition_D(sLogit);
     Tensor tR2SrLogit_view = smem_thr_copy_logit.retile_S(tMMArLogit);
+    Tensor tR2ScLogit = smem_thr_copy_logit.partition_D(cLogit);
+
+    // REG -> SMEM for BF16 2 consecutive elements
+    auto smem_tiled_copy_logit_bf16 = make_tiled_copy_C(Copy_Atom<UniversalCopy<uint32_t, uint32_t>, typename Traits::OUT_DTYPE>{},
+                                                        tiled_mma);
+    auto smem_thr_copy_logit_bf16 = smem_tiled_copy_logit_bf16.get_slice(threadIdx.x);
+    Tensor tR2SsLogit_bf16 = smem_thr_copy_logit_bf16.partition_D(sLogit_bf16);
+    Tensor tR2SrLogit_bf16_view = smem_thr_copy_logit_bf16.retile_S(tMMArLogit_outT);
 
 #if 1
     // LDS.128 & STS.128 for float32
-    auto gmem_tiled_copy_logit = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t, uint128_t>, float>{},
-                                                 /*thr=*/Layout<Shape<Int<Traits::threads / 32>, _32>,
-                                                                Stride<_32, _1>>{},
+    auto uint4_tiled_copy_logit = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t, uint128_t>, float>{},
+                                                 /*thr=*/Layout<Shape<Int<Traits::threads / 8>, _8>,
+                                                                Stride<_8, _1>>{},
                                                  /*value=*/Layout<Shape<_1, _4>,
                                                                   Stride<_4, _1>>{});
-    static_assert(size(gmem_tiled_copy_logit) == Traits::threads, "gmem_tiled_copy_logit must have the same number of threads");
-    static_assert(Traits::tileN % 128 == 0, "tileN must be a multiple of 128");
-    auto gmem_thr_copy_logit = gmem_tiled_copy_logit.get_slice(threadIdx.x);
+    static_assert(size(uint4_tiled_copy_logit) == Traits::threads, "uint4_tiled_copy_logit must have the same number of threads");
+    static_assert(Traits::tileN % 32 == 0, "tileN must be a multiple of 32");
+    auto uint4_thr_copy_logit = uint4_tiled_copy_logit.get_slice(threadIdx.x);
 
-    Tensor tS2GgLogit = gmem_thr_copy_logit.partition_D(gLogits);
-    Tensor tS2GsLogit = gmem_thr_copy_logit.partition_S(sLogit);
-    Tensor tS2GcLogit = gmem_thr_copy_logit.partition_D(cLogit);
+    Tensor tS2GgLogit = uint4_thr_copy_logit.partition_D(gLogits);
+    Tensor tS2GsLogit = uint4_thr_copy_logit.partition_S(sLogit);
+    Tensor tS2GcLogit = uint4_thr_copy_logit.partition_D(cLogit);
 #endif
+    // LDS.128 & STS.128 for BF16
+    auto uint4_tiled_copy_logit_bf16 = make_tiled_copy(
+        Copy_Atom<UniversalCopy<uint128_t, uint128_t>, typename Traits::OUT_DTYPE>{},
+        /*thr=*/Layout<Shape<Int<Traits::threads / 8>, _8>,
+                       Stride<_8, _1>>{},
+        /*value=*/Layout<Shape<_1, _8>, Stride<_8, _1>>{});
+    static_assert(size(uint4_tiled_copy_logit_bf16) == Traits::threads, 
+        "uint4_tiled_copy_logit_bf16 must have the same number of threads");
+    static_assert(Traits::tileN % 64 == 0, "tileN must be a multiple of 64");
+    auto uint4_thr_copy_logit_bf16 = uint4_tiled_copy_logit_bf16.get_slice(threadIdx.x);
+
+    Tensor tS2GgGradLogits = uint4_thr_copy_logit_bf16.partition_D(gGradLogits);
+    Tensor tS2GsGradLogits = uint4_thr_copy_logit_bf16.partition_S(sLogit_bf16);
+    Tensor tS2GcGradLogits = uint4_thr_copy_logit_bf16.partition_D(cLogit);
 
     int32_t k_tile_count = size<3>(tG2SgH);
     int32_t k_tile_next = 0;
@@ -974,14 +1172,15 @@ __global__ void backward_d_logits_kernel(int32_t num_tokens,
         } // k-blocks
     } // mainloop on k-tiles
 
-    // epilogue
-    // REG -> SMEM
-    copy(smem_tiled_copy_logit,
-         /*src=*/tR2SrLogit_view,
-         /*dst=*/tR2SsLogit);
-    __syncthreads();
+    // ================== epilogue ==================
 #if 1
     if (gmem_output_ptr != nullptr) {
+        // REG -> SMEM
+        copy(smem_tiled_copy_logit,
+            /*src=*/tR2SrLogit_view,
+            /*dst=*/tR2SsLogit);
+        __syncthreads();
+
         // SMEM -> GMEM
         #pragma unroll
         for (int32_t m = 0; m < size<1>(tS2GcLogit); m++) {
@@ -989,15 +1188,74 @@ __global__ void backward_d_logits_kernel(int32_t num_tokens,
             for (int32_t n = 0; n < size<2>(tS2GcLogit); n++) {
                 if (get<0>(tS2GcLogit(0, m, n)) < (num_tokens - pid_m * Traits::tileM)
                     && get<1>(tS2GcLogit(0, m, n)) < (vocab_size - pid_n * Traits::tileN)) {
-                    copy(gmem_tiled_copy_logit,
+                    copy(uint4_tiled_copy_logit,
                          tS2GsLogit(_, m, n),
                          tS2GgLogit(_, m, n));
                 }
             }
         }
+        __syncthreads();
     }
 #endif
+    // branch will handle fp32 one-by-one
+    auto valid = [&](int32_t k, int32_t m, int32_t n, int32_t pid_m, int32_t pid_n) {
+        return (get<0>(tMMAcLogit(k, m, n)) < (num_tokens - pid_m * Traits::tileM)
+                && get<1>(tMMAcLogit(k, m, n)) < (vocab_size - pid_n * Traits::tileN));
+    };
+    #pragma unroll
+    for (int32_t k = 0; k < size<0>(tMMAcLogit); k++) {
+        #pragma unroll
+        for (int32_t m = 0; m < size<1>(tMMAcLogit); m++) {
+            #pragma unroll
+            for (int32_t n = 0; n < size<2>(tMMAcLogit); n++) {
+                tMMArLogit(k, m, n) *= valid(k, m, n, pid_m, pid_n);
 
+                int32_t m_idx = get<0>(tMMAcLogit(k, m, n));
+                float exp_logit = __expf(tMMArLogit(k, m, n) - sMaximum(m_idx, Int<0>{}));
+                float accu_rcp = __frcp_rn(sAccumulate(m_idx, Int<0>{}));
+                int64_t global_n_idx = get<1>(tMMAcLogit(k, m, n))
+                                        + pid_n * Traits::tileN
+                                        + rank * vocab_size;
+                float tmp = __fmaf_ieee_rn(exp_logit, accu_rcp, -1.0f * (sLabels(m_idx, Int<0>{}) == global_n_idx));
+                float d_logit = sGradLogprobs(m_idx, Int<0>{}) * tmp;
+                d_logit += sGradEntropy(m_idx, Int<0>{}) * (-1.0f * exp_logit * accu_rcp) * (tMMArLogit(k, m, n) - sEntropyB(m_idx, Int<0>{}));
+
+                tMMArLogit(k, m, n) = d_logit;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int32_t k = 0; k < size(get<1>(shape<0>(tR2ScLogit))); k++) {
+        #pragma unroll
+        for (int32_t m = 0; m < size<1>(tR2ScLogit); m++) {
+            #pragma unroll
+            for (int32_t n = 0; n < size<2>(tR2ScLogit); n++) {
+                // *(reinterpret_cast<__nv_bfloat162*>(tR2SrLogit_bf16_view(make_coord(_, k), m, n).data())) 
+                //     = __float22bfloat162_rn(
+                //         *reinterpret_cast<float2*>(tR2SrLogit_view(make_coord(_, k), m, n).data()));
+                *(reinterpret_cast<__nv_bfloat162*>(&(tR2SrLogit_bf16_view(make_coord(_, k), m, n))[0]))
+                    = __float22bfloat162_rn(
+                        *reinterpret_cast<float2*>(&(tR2SrLogit_view(make_coord(_, k), m, n)[0])));
+                copy(smem_tiled_copy_logit_bf16,
+                     /*src=*/tR2SrLogit_bf16_view(make_coord(_, k), m, n),
+                     /*dst=*/tR2SsLogit_bf16(make_coord(_, k), m, n));
+            }
+        }
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int32_t m = 0; m < size<1>(tS2GcGradLogits); m++) {
+        #pragma unroll
+        for (int32_t n = 0; n < size<2>(tS2GcGradLogits); n++) {
+            if (get<0>(tS2GcGradLogits(0, m, n)) < (num_tokens - pid_m * Traits::tileM)
+                && get<1>(tS2GcGradLogits(0, m, n)) < (vocab_size - pid_n * Traits::tileN)) {
+                copy(uint4_tiled_copy_logit_bf16,
+                    /*src=*/tS2GsGradLogits(_, m, n),
+                    /*dst=*/tS2GgGradLogits(_, m, n));
+            }
+        }
+    }
 }
 
 
