@@ -83,4 +83,73 @@ void forward_mainloop<__nv_bfloat16, __nv_bfloat16>(int32_t rank,
     CUDA_THROW(cudaGetLastError());
 }
 
+template <>
+void backward_d_logits<float, float>(int32_t num_tokens,
+                       int32_t hidden_size,
+                       int32_t vocab_size,
+                       int32_t rank,
+                       float *hidden_ptr,
+                       float *weight_ptr,
+                       int64_t *labels_ptr,
+                       float *maximum_ptr,
+                       float *accumulate_ptr,
+                       float *entropy_b_ptr,
+                       float *grad_entropy_ptr,
+                       float *grad_logprobs_ptr,
+                       float *grad_logits_ptr,
+                       float *gmem_output_ptr,
+                       cudaStream_t stream) {
+    throw std::invalid_argument("backward_d_logits is not implemented for float");
+}
+
+template <>
+void backward_d_logits<__nv_bfloat16, __nv_bfloat16>(int32_t num_tokens,
+                                                    int32_t hidden_size,
+                                                    int32_t vocab_size,
+                                                    int32_t rank,
+                                                    __nv_bfloat16 *hidden_ptr,
+                                                    __nv_bfloat16 *weight_ptr,
+                                                    int64_t *labels_ptr,
+                                                    float *maximum_ptr,
+                                                    float *accumulate_ptr,
+                                                    float *entropy_b_ptr,
+                                                    float *grad_entropy_ptr,
+                                                    float *grad_logprobs_ptr,
+                                                    __nv_bfloat16 *grad_logits_ptr,
+                                                    float *gmem_output_ptr,
+                                                    cudaStream_t stream) {
+    using Traits = lce::Traits<__nv_bfloat16, __nv_bfloat16, 4096>;
+
+    int32_t num_blocks_m = (num_tokens + Traits::tileM - 1) / Traits::tileM;
+    int32_t num_blocks_n = (vocab_size + Traits::tileN - 1) / Traits::tileN;
+    int32_t num_blocks = num_blocks_m * num_blocks_n;
+    num_blocks *= Traits::threadBlockSwizzleSize;
+
+    if (vocab_size % 4 != 0) {
+        throw std::invalid_argument("vocab_size must be divisible by 4");
+    }
+
+    dim3 block(Traits::threads, 1, 1);
+    dim3 grid(num_blocks, 1, 1);
+
+    auto kernel = lce::backward_d_logits_kernel<Traits>;
+
+    size_t smem_bytes = std::max(Traits::smem_hidden_bytes + Traits::smem_weight_bytes,
+                                 Traits::smem_logit_bytes);
+    if (smem_bytes >= 48 * 1024ul) {
+        CUDA_THROW(cudaFuncSetAttribute(kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             smem_bytes));
+    }
+    kernel<<<grid, block, smem_bytes, stream>>>(
+        num_tokens, hidden_size, vocab_size, rank,
+        hidden_ptr, weight_ptr, labels_ptr,
+        maximum_ptr, accumulate_ptr, entropy_b_ptr,
+        grad_entropy_ptr, grad_logprobs_ptr,
+        grad_logits_ptr,
+        gmem_output_ptr
+    );
+    CUDA_THROW(cudaGetLastError());
+}
+
 } // namespace lce

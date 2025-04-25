@@ -40,5 +40,23 @@ void forward_mainloop(int32_t rank,
                       float *gmem_output_ptr,
                       cudaStream_t stream);
 
+template <typename InT, typename OutT>
+void backward_d_logits(int32_t num_tokens,
+                       int32_t hidden_size,
+                       int32_t vocab_size,
+                       int32_t rank,
+                       InT *hidden_ptr,
+                       InT *weight_ptr,
+                       int64_t *labels_ptr,
+                       float *maximum_ptr,
+                       float *accumulate_ptr,
+                       float *entropy_b_ptr,
+                       float *grad_entropy_ptr,
+                       float *grad_logprobs_ptr,
+                       OutT *grad_logits_ptr,
+                       float *gmem_output_ptr,
+                       cudaStream_t stream);
+
+
 } // namespace lce
 #endif

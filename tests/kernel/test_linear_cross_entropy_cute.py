@@ -100,7 +100,8 @@ class TestLinearCrossEntropyCUTE:
         final_logprobs = torch.empty(self.num_tokens, dtype=torch.float32, device="cuda")
         final_logprobs_scalar = torch.empty((), dtype=torch.float32, device="cuda")
 
-        gmem_output = torch.empty((self.num_tokens, self.vocab_size), dtype=torch.float, device="cuda")
+        # gmem_output = torch.empty((self.num_tokens, self.vocab_size), dtype=torch.float, device="cuda")
+        gmem_output = None
 
         start.record()
         with torch.cuda.nvtx.range("forward_mainloop"):
@@ -113,32 +114,33 @@ class TestLinearCrossEntropyCUTE:
                                     _max, _max.stride(0), _max.stride(1),
                                     _acc, _acc.stride(0), _acc.stride(1),
                                     _entropy_b, _entropy_b.stride(0), _entropy_b.stride(1),
-                                    final_logprobs, final_logprobs_scalar, #None)#,
+                                    final_logprobs, final_logprobs_scalar,
                                     gmem_output)
         end.record()
         torch.cuda.synchronize()
         print(f"CUTE forward time: {start.elapsed_time(end)} ms")
         
-        print("gmem_output:")
-        print(gmem_output)
+        if gmem_output is not None:
+            print("gmem_output:")
+            print(gmem_output)
 
-        print("torch logits")
-        print(logits)
+            print("torch logits")
+            print(logits)
 
-        # Find the maximum absolute difference
-        logits_float = logits.to(torch.float)
-        abs_diff = (gmem_output - logits_float).abs()
-        max_diff_value = abs_diff.max().item()
-        max_diff_indices = (abs_diff == max_diff_value).nonzero()[0]
-        i, j = max_diff_indices
-        
-        print(f"Maximum absolute difference: {max_diff_value}")
-        print(f"At position: [{i}, {j}]")
-        print(f"CUTE value: {gmem_output[i, j].item()}")
-        print(f"PyTorch value: {logits_float[i, j].item()}")
-        
-        # torch.testing.assert_close(gmem_output, logits_float,
-        #                            atol=1e-2, rtol=1e-2)
+            # Find the maximum absolute difference
+            logits_float = logits.to(torch.float)
+            abs_diff = (gmem_output - logits_float).abs()
+            max_diff_value = abs_diff.max().item()
+            max_diff_indices = (abs_diff == max_diff_value).nonzero()[0]
+            i, j = max_diff_indices
+            
+            print(f"Maximum absolute difference: {max_diff_value}")
+            print(f"At position: [{i}, {j}]")
+            print(f"CUTE value: {gmem_output[i, j].item()}")
+            print(f"PyTorch value: {logits_float[i, j].item()}")
+            
+            torch.testing.assert_close(gmem_output, logits_float,
+                                    atol=1e-2, rtol=1e-2)
 
         torch.testing.assert_close(split_max, _max,
                                    atol=1e-2, rtol=1e-2)
@@ -150,6 +152,46 @@ class TestLinearCrossEntropyCUTE:
                                    atol=1e-1, rtol=1e-1)
         print("forward path correctness verified")
 
+
+        # ------------ backward ------------
+        print("")
+        maximum = torch.empty((self.num_tokens), dtype=torch.float32, device="cuda")
+        accumulate = torch.empty((self.num_tokens), dtype=torch.float32, device="cuda")
+        entropy_b = torch.empty((self.num_tokens), dtype=torch.float32, device="cuda")
+        grad_entropy = torch.empty((self.num_tokens), dtype=torch.float32, device="cuda")
+        grad_logprobs = torch.empty((self.num_tokens), dtype=torch.float32, device="cuda")
+        grad_logits = torch.empty((self.num_tokens, self.vocab_size), dtype=self.dtype, device="cuda")
+
+        gmem_output = torch.empty((self.num_tokens, self.vocab_size), dtype=torch.float32, device="cuda")
+
+        start.record()
+        with torch.cuda.nvtx.range("backward_d_logits"):
+            lce_ext.backward_d_logits(self.num_tokens, self.hidden_size, self.vocab_size, rank,
+                                      hidden, hidden.stride(0), hidden.stride(1),
+                                      weight, weight.stride(0), weight.stride(1),
+                                      labels, labels.stride(0),
+                                      maximum, maximum.stride(0),
+                                      accumulate, accumulate.stride(0),
+                                      entropy_b, entropy_b.stride(0),
+                                      grad_entropy, grad_entropy.stride(0),
+                                      grad_logprobs, grad_logprobs.stride(0),
+                                      grad_logits, grad_logits.stride(0), grad_logits.stride(1),
+                                      gmem_output)
+        end.record()
+        torch.cuda.synchronize()
+        print(f"CUTE backward time: {start.elapsed_time(end)} ms")
+
+        if gmem_output is not None:
+            print("gmem_output:")
+            print(gmem_output)
+
+            print("torch logits")
+            print(logits)
+            
+            torch.testing.assert_close(gmem_output, logits,
+                                       atol=1e-2, rtol=1e-2)
+            
+            
 
 if __name__ == "__main__":
     torch.manual_seed(233376)

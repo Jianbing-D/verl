@@ -24,7 +24,11 @@ using namespace cute;
 
 template <typename InT, typename OutT,
           int32_t _dim,
-          typename _ThreadLayout = _3DLayout<4, 2, 1>>
+          typename _ThreadLayout = _3DLayout<4, 2, 1>,
+          int32_t _tileM = 128,
+          int32_t _tileN = 128,
+          int32_t _threadBlockSwizzleSize = 4,
+          int32_t _pipe = 3>
 struct Traits {
     using IN_DTYPE = InT;
     using OUT_DTYPE = OutT;
@@ -33,18 +37,18 @@ struct Traits {
     using ThreadLayout = _ThreadLayout;
     static_assert(ThreadLayout::K == 1, "ThreadLayout::K must be 1");
 
-    static constexpr int32_t tileM = 128;
-    static constexpr int32_t tileN = 128;
+    static constexpr int32_t tileM = _tileM;
+    static constexpr int32_t tileN = _tileN;
     static constexpr int32_t tileK = 128 / sizeof(InT);
 
     // length of elements per token, that is hidden_size
     static constexpr int32_t dim = _dim;
     static_assert(dim % tileK == 0, "dim must be divisible by tileK");
 
-    static constexpr int32_t threadBlockSwizzleSize = 4;
+    static constexpr int32_t threadBlockSwizzleSize = _threadBlockSwizzleSize;
 
     // pipeline size
-    static constexpr int32_t pipe = 3;
+    static constexpr int32_t pipe = _pipe;
 
     // specify the basic MMA instruction
     using MMA_INST = SM80_16x8x16_F32BF16BF16F32_TN;
@@ -107,9 +111,9 @@ struct Traits {
     static constexpr size_t smem_hidden_bytes = sizeof(InT) * size(SmemLayoutHidden{});
     static constexpr size_t smem_weight_bytes = sizeof(InT) * size(SmemLayoutWeight{}); 
 
-    using SmemLayoutOutput = decltype(tile_to_shape(SmemLayoutAtom{},
+    using SmemLayoutLogit = decltype(tile_to_shape(SmemLayoutAtom{},
                                                     Shape<Int<tileM>, Int<tileN>>{}));
-    static constexpr size_t smem_output_bytes = sizeof(float) * size(SmemLayoutOutput{});
+    static constexpr size_t smem_logit_bytes = sizeof(float) * size(SmemLayoutLogit{});
 
     using SmemLinearLayout = Layout<Shape<Int<tileM>, _1>,
                                     Stride<_1, Int<tileM>>>;
@@ -117,7 +121,7 @@ struct Traits {
 
     static constexpr size_t smem_bytes = smem_hidden_bytes 
                                         + smem_weight_bytes 
-                                        + smem_output_bytes
+                                        + smem_logit_bytes
                                         + smem_labels_bytes
                                         + 1024; // additional 1024 bytes for alignment
 };
@@ -250,12 +254,12 @@ __global__ void forward_mainloop_kernel(int32_t rank,
     Tensor sLogit = make_tensor(make_smem_ptr(reinterpret_cast<float*>(smem_aligned
                                         + Traits::smem_hidden_bytes
                                         + Traits::smem_weight_bytes)),
-                                 typename Traits::SmemLayoutOutput{});
+                                 typename Traits::SmemLayoutLogit{});
     // (tileM, 1)
     Tensor sLabels = make_tensor(make_smem_ptr(reinterpret_cast<int64_t*>(smem_aligned
                                         + Traits::smem_hidden_bytes
                                         + Traits::smem_weight_bytes
-                                        + Traits::smem_output_bytes)),
+                                        + Traits::smem_logit_bytes)),
                                  typename Traits::SmemLinearLayout{});    
                                 
     // GMEM -> SMEM
@@ -384,8 +388,8 @@ __global__ void forward_mainloop_kernel(int32_t rank,
     float entropy_b[size<1>(tSrLogit_copy_view)] = {0.f};
 
     int32_t n_tile_count = size<3>(tBgW);
-    int32_t vocab_left_bound = pid_n * vocab_per_split;
-    int32_t vocab_right_bound = min((pid_n + 1) * vocab_per_split, vocab_size);
+    int32_t vocab_left_bound = pid_n * vocab_per_split + rank * vocab_size;
+    int32_t vocab_right_bound = min((pid_n + 1) * vocab_per_split, vocab_size) + rank * vocab_size;
     for (int32_t n_tile = 0; n_tile < n_tile_count; ++n_tile) {
         // update the predicate for weight along N
         CUTLASS_PRAGMA_UNROLL
@@ -716,6 +720,286 @@ __global__ void forward_mainloop_kernel(int32_t rank,
         }
     }
 }
+
+template <typename Traits>
+__launch_bounds__(Traits::threads)
+__global__ void backward_d_logits_kernel(int32_t num_tokens,
+                                         int32_t hidden_size,
+                                         int32_t vocab_size,
+                                         int32_t rank,
+                                         typename Traits::IN_DTYPE *hidden_ptr,
+                                         typename Traits::IN_DTYPE *weight_ptr,
+                                         int64_t *labels_ptr,
+                                         float *maximum_ptr,
+                                         float *accumulate_ptr,
+                                         float *entropy_b_ptr,
+                                         float *grad_entropy_ptr,
+                                         float *grad_logprobs_ptr,
+                                         typename Traits::OUT_DTYPE *grad_logits_ptr,
+                                         float *gmem_output_ptr) {
+    extern __shared__ char smem_[];
+    char *smem_aligned = (char*)(((intptr_t)smem_ + 1023) & ~1023);
+
+    int32_t num_pid_m = (num_tokens + Traits::tileM - 1) / Traits::tileM;
+    int32_t num_pid_n = (vocab_size + Traits::tileN - 1) / Traits::tileN;
+
+    const auto [pid_m, pid_n] = [&]() -> std::tuple<int32_t, int32_t> {
+        int32_t gdimx = num_pid_m * Traits::threadBlockSwizzleSize;
+        int32_t bidm = blockIdx.x % gdimx;
+        int32_t bidn = blockIdx.x / gdimx;
+        int32_t pid_m = bidm / Traits::threadBlockSwizzleSize;
+        int32_t pid_n = bidn * Traits::threadBlockSwizzleSize + (bidm % Traits::threadBlockSwizzleSize);
+        return {pid_m, pid_n};
+    }();
+    if (pid_m >= num_pid_m || pid_n >= num_pid_n) { return; }
+
+    // (num_tokens, dim)
+    Tensor mHidden = make_tensor(make_gmem_ptr(reinterpret_cast<typename Traits::IN_DTYPE*>(hidden_ptr)),
+                                 make_shape(num_tokens, Int<Traits::dim>{}),
+                                 make_stride(Int<Traits::dim>{}, _1{}));
+    // (vocab_size, dim)
+    Tensor mWeight = make_tensor(make_gmem_ptr(reinterpret_cast<typename Traits::IN_DTYPE*>(weight_ptr)),
+                                 make_shape(vocab_size, Int<Traits::dim>{}),
+                                 make_stride(Int<Traits::dim>{}, _1{}));
+    // ((tileM, tileK), k)
+    Tensor gHidden = local_tile(mHidden,
+                                Shape<Int<Traits::tileM>, Int<Traits::tileK>>{},
+                                make_coord(pid_m, _));
+    // ((tileN, tileK), k)
+    Tensor gWeight = local_tile(mWeight,
+                                Shape<Int<Traits::tileN>, Int<Traits::tileK>>{},
+                                make_coord(pid_n, _)); 
+    // (tileM, tileK, pipe)
+    Tensor sHidden = make_tensor(make_smem_ptr(reinterpret_cast<typename Traits::IN_DTYPE*>(smem_aligned)),
+                                 typename Traits::SmemLayoutHidden{});
+    // (tileN, tileK, pipe)
+    Tensor sWeight = make_tensor(make_smem_ptr(reinterpret_cast<typename Traits::IN_DTYPE*>(smem_aligned
+                                        + Traits::smem_hidden_bytes)),
+                                 typename Traits::SmemLayoutWeight{});
+#if 1
+    // (num_tokens, vocab_size)
+    Tensor mLogits = make_tensor(make_gmem_ptr(reinterpret_cast<float *>(gmem_output_ptr)),
+                                 make_shape(num_tokens, vocab_size),
+                                 make_stride(vocab_size, _1{}));
+    // (tileM, tileN)
+    Tensor gLogits = local_tile(mLogits,
+                                Shape<Int<Traits::tileM>, Int<Traits::tileN>>{},
+                                make_coord(pid_m, pid_n));
+#endif
+    // (tileM, tileN)
+    Tensor sLogit = make_tensor(make_smem_ptr(reinterpret_cast<float*>(smem_aligned)),
+                                typename Traits::SmemLayoutLogit{});
+
+    // GMEM -> SMEM
+    typename Traits::TiledCopy gmem_tiled_copy_hidden;
+    typename Traits::TiledCopy gmem_tiled_copy_weight;
+    ThrCopy thr_copy_hidden = gmem_tiled_copy_hidden.get_slice(threadIdx.x);
+    ThrCopy thr_copy_weight = gmem_tiled_copy_weight.get_slice(threadIdx.x);
+
+    Tensor tG2SgH = thr_copy_hidden.partition_S(gHidden); // (CPY, CPY_M, CPY_K, k)
+    Tensor tG2SsH = thr_copy_hidden.partition_D(sHidden); // (CPY, CPY_M, CPY_K, pipe)
+
+    Tensor tG2SgW = thr_copy_weight.partition_S(gWeight); // (CPY, CPY_N, CPY_K, k)
+    Tensor tG2SsW = thr_copy_weight.partition_D(sWeight); // (CPY, CPY_N, CPY_K, pipe)
+
+    static_assert(size<0>(tG2SgH) == size<0>(tG2SsH), "tG2SgH and tG2SsH must have the same number of copies");
+    static_assert(size<1>(tG2SgH) == size<1>(tG2SsH), "tG2SgH and tG2SsH must have the same number of rows");
+    static_assert(size<2>(tG2SgH) == size<2>(tG2SsH), "tG2SgH and tG2SsH must have the same number of columns");
+    static_assert(size<0>(tG2SgW) == size<0>(tG2SsW), "tG2SgW and tG2SsW must have the same number of copies");
+    static_assert(size<1>(tG2SgW) == size<1>(tG2SsW), "tG2SgW and tG2SsW must have the same number of rows");
+    static_assert(size<2>(tG2SgW) == size<2>(tG2SsW), "tG2SgW and tG2SsW must have the same number of columns");
+
+    Tensor cHidden = make_identity_tensor(make_shape(size<0>(sHidden), size<1>(sHidden)));
+    Tensor cWeight = make_identity_tensor(make_shape(size<0>(sWeight), size<1>(sWeight)));
+    Tensor tG2ScH = thr_copy_hidden.partition_S(cHidden); // (CPY, CPY_M, CPY_K)
+    Tensor tG2ScW = thr_copy_weight.partition_S(cWeight); // (CPY, CPY_N, CPY_K)
+
+    // MMA
+    typename Traits::TiledMMA tiled_mma;
+    ThrMMA thr_mma = tiled_mma.get_slice(threadIdx.x);
+
+    Tensor tMMAsH = thr_mma.partition_A(sHidden); // (MMA, MMA_M, MMA_K, pipe)
+    Tensor tMMAsW = thr_mma.partition_B(sWeight); // (MMA, MMA_N, MMA_K, pipe)
+
+    Tensor cLogit = make_identity_tensor(make_shape(size<0>(sLogit), size<1>(sLogit)));
+    Tensor tMMAcLogit = thr_mma.partition_C(cLogit); // (MMA, MMA_M, MMA_N)
+
+    // (MMA, MMA_M, MMA_N)
+    Tensor tMMArLogit = partition_fragment_C(tiled_mma,
+                                             Shape<Int<Traits::tileM>, 
+                                                   Int<Traits::tileN>>{});
+    // (MMA, MMA_M, MMA_K)
+    Tensor tMMArH = thr_mma.make_fragment_A(tMMAsH(_, _, _, Int<0>{}));
+    // (MMA, MMA_N, MMA_K)
+    Tensor tMMArW = thr_mma.make_fragment_B(tMMAsW(_, _, _, Int<0>{}));
+    
+    // SMEM -> REG
+    auto smem_tiled_copy_hidden = typename Traits::TiledLDSM_A{};
+    auto smem_thr_copy_hidden = smem_tiled_copy_hidden.get_slice(threadIdx.x);
+    Tensor tS2RsH = smem_thr_copy_hidden.partition_S(sHidden); // (CPY, CPY_M, CPY_K, pipe)
+    Tensor tS2RrH_view = smem_thr_copy_hidden.retile_D(tMMArH); // (CPY, CPY_M, CPY_K)
+
+    auto smem_tiled_copy_weight = typename Traits::TiledLDSM_B{};
+    auto smem_thr_copy_weight = smem_tiled_copy_weight.get_slice(threadIdx.x);
+    Tensor tS2RsW = smem_thr_copy_weight.partition_S(sWeight); // (CPY, CPY_N, CPY_K, pipe)
+    Tensor tS2RrW_view = smem_thr_copy_weight.retile_D(tMMArW); // (CPY, CPY_N, CPY_K)
+
+    // REG -> SMEM for float32
+    auto smem_tiled_copy_logit = make_tiled_copy_C(Copy_Atom<UniversalCopy<uint64_t, uint64_t>, float>{},
+                                                   tiled_mma);
+    auto smem_thr_copy_logit = smem_tiled_copy_logit.get_slice(threadIdx.x);
+    Tensor tR2SsLogit = smem_thr_copy_logit.partition_D(sLogit);
+    Tensor tR2SrLogit_view = smem_thr_copy_logit.retile_S(tMMArLogit);
+
+#if 1
+    // LDS.128 & STS.128 for float32
+    auto gmem_tiled_copy_logit = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t, uint128_t>, float>{},
+                                                 /*thr=*/Layout<Shape<Int<Traits::threads / 32>, _32>,
+                                                                Stride<_32, _1>>{},
+                                                 /*value=*/Layout<Shape<_1, _4>,
+                                                                  Stride<_4, _1>>{});
+    static_assert(size(gmem_tiled_copy_logit) == Traits::threads, "gmem_tiled_copy_logit must have the same number of threads");
+    static_assert(Traits::tileN % 128 == 0, "tileN must be a multiple of 128");
+    auto gmem_thr_copy_logit = gmem_tiled_copy_logit.get_slice(threadIdx.x);
+
+    Tensor tS2GgLogit = gmem_thr_copy_logit.partition_D(gLogits);
+    Tensor tS2GsLogit = gmem_thr_copy_logit.partition_S(sLogit);
+    Tensor tS2GcLogit = gmem_thr_copy_logit.partition_D(cLogit);
+#endif
+
+    int32_t k_tile_count = size<3>(tG2SgH);
+    int32_t k_tile_next = 0;
+    #pragma unroll
+    for (int32_t k_pipe = 0; k_pipe < Traits::pipe - 1; ++k_pipe) {
+        #pragma unroll
+        for (int32_t m = 0; m < size<1>(tG2SgH); ++m) {
+            if (get<0>(tG2ScH(0, m, 0)) < (num_tokens - pid_m * Traits::tileM)) {
+                copy(gmem_tiled_copy_hidden,
+                     /*src*/tG2SgH(_, m, _, k_tile_next),
+                     /*dst*/tG2SsH(_, m, _, k_pipe));
+            }
+        }
+        #pragma unroll
+        for (int32_t n = 0; n < size<1>(tG2SgW); ++n) {
+            if (get<1>(tG2ScW(0, n, 0)) < vocab_size - pid_n * Traits::tileN) {
+                copy(gmem_tiled_copy_weight,
+                     /*src=*/tG2SgW(_, n, _, k_tile_next),
+                     /*dst=*/tG2SsW(_, n, _, k_pipe));
+            }
+        }
+        cp_async_fence();
+        --k_tile_count;
+        if (k_tile_count > 0) { ++k_tile_next; }
+    } // prefetch G2S
+
+    clear(tMMArLogit);
+
+    int32_t smem_pipe_read = 0;
+    int32_t smem_pipe_write = Traits::pipe - 1;
+
+    Tensor tS2RsH_p = tS2RsH(_, _, _, smem_pipe_read);
+    Tensor tS2RsW_p = tS2RsW(_, _, _, smem_pipe_read);
+
+    constexpr int32_t k_block_max = size<2>(tMMArH);
+    if constexpr (k_block_max > 1) {
+        cp_async_wait<Traits::pipe - 2>();
+        __syncthreads();
+
+        // SMEM -> REG
+        copy(smem_tiled_copy_hidden,
+             /*src*/tS2RsH_p(_, _, Int<0>{}),
+             /*dst*/tS2RrH_view(_, _, Int<0>{}));
+        copy(smem_tiled_copy_weight,
+             /*src=*/tS2RsW_p(_, _, Int<0>{}),
+             /*dst=*/tS2RrW_view(_, _, Int<0>{}));
+    }
+
+    // pipelined mainloop on k-tiles
+    CUTE_NO_UNROLL
+    while (k_tile_count > -(Traits::pipe - 1)) {
+        // iterate over k-blocks
+        CUTE_UNROLL
+        for (int32_t k_block = 0; k_block < k_block_max; ++k_block) {
+            if (k_block == k_block_max - 1) {
+                tS2RsH_p = tS2RsH(_, _, _, smem_pipe_read);
+                tS2RsW_p = tS2RsW(_, _, _, smem_pipe_read);
+                cp_async_wait<Traits::pipe - 2>();
+                __syncthreads();
+            }
+
+            int32_t k_block_next = (k_block + Int<1>{}) % k_block_max;
+            copy(smem_tiled_copy_hidden,
+                 tS2RsH_p(_, _, k_block_next),
+                 tS2RrH_view(_, _, k_block_next));
+            copy(smem_tiled_copy_weight,
+                 tS2RsW_p(_, _, k_block_next),
+                 tS2RrW_view(_, _, k_block_next));
+
+            if (k_block == 0) {
+                #pragma unroll
+                for (int32_t m = 0; m < size<1>(tG2SgH); m++) {
+                    if (get<0>(tG2ScH(0, m, 0)) < (num_tokens - pid_m * Traits::tileM)) {
+                        copy(gmem_tiled_copy_hidden,
+                             tG2SgH(_, m, _, k_tile_next),
+                             tG2SsH(_, m, _, smem_pipe_write));
+                    }
+                }
+                #pragma unroll
+                for (int32_t n = 0; n < size<1>(tG2SgW); n++) {
+                    if (get<1>(tG2ScW(0, n, 0)) < (vocab_size - pid_n * Traits::tileN)) {
+                        copy(gmem_tiled_copy_weight,
+                            tG2SgW(_, n, _, k_tile_next),
+                            tG2SsW(_, n, _, smem_pipe_write));
+                    }
+                }
+                cp_async_fence();
+
+                // advance tile
+                --k_tile_count;
+                if (k_tile_count > 0) { ++k_tile_next; }
+
+                // advance smem pipe
+                smem_pipe_write = smem_pipe_read;
+                ++smem_pipe_read;
+                smem_pipe_read = (smem_pipe_read == Traits::pipe)
+                                  ? 0
+                                  : smem_pipe_read;
+            } // first block on this tile
+
+            // MMA 
+            gemm(tiled_mma, 
+                 tMMArH(_, _, k_block),
+                 tMMArW(_, _, k_block),
+                 tMMArLogit);
+        } // k-blocks
+    } // mainloop on k-tiles
+
+    // epilogue
+    // REG -> SMEM
+    copy(smem_tiled_copy_logit,
+         /*src=*/tR2SrLogit_view,
+         /*dst=*/tR2SsLogit);
+    __syncthreads();
+#if 1
+    if (gmem_output_ptr != nullptr) {
+        // SMEM -> GMEM
+        #pragma unroll
+        for (int32_t m = 0; m < size<1>(tS2GcLogit); m++) {
+            #pragma unroll
+            for (int32_t n = 0; n < size<2>(tS2GcLogit); n++) {
+                if (get<0>(tS2GcLogit(0, m, n)) < (num_tokens - pid_m * Traits::tileM)
+                    && get<1>(tS2GcLogit(0, m, n)) < (vocab_size - pid_n * Traits::tileN)) {
+                    copy(gmem_tiled_copy_logit,
+                         tS2GsLogit(_, m, n),
+                         tS2GgLogit(_, m, n));
+                }
+            }
+        }
+    }
+#endif
+
+}
+
 
 #undef _ENABLE_GMEM_RESULT
 
