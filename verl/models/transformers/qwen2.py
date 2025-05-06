@@ -223,3 +223,104 @@ def qwen2_attn_forward(
     attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
     attn_output = self.o_proj(attn_output)
     return attn_output, attn_weights
+
+
+def qwen2_fused_forward(
+    self,
+    input_ids: torch.LongTensor = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    labels: Optional[torch.LongTensor] = None,
+    use_cache: Optional[bool] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    return_dict: Optional[bool] = None,
+    cache_position: Optional[torch.LongTensor] = None,
+    logits_to_keep: Union[int, torch.Tensor] = 0,
+    fuse_entropy_logprobs: Optional[bool] = False,
+    temperature: Optional[float] = None,
+    **kwargs,
+) -> Union[Tuple, FusedCausalLMOutputWithPast]:
+
+    # FIXME: remove this
+    # print(f"fuse_entropy_logprobs: {fuse_entropy_logprobs}")
+    # print(f"labels: {labels.shape}")
+    # print(f"temperature: {temperature}")
+    # print(f"training: {self.training}")
+
+    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+    output_hidden_states = (
+        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+    )
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+    outputs = self.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        return_dict=return_dict,
+        cache_position=cache_position,
+    )
+
+    hidden_states = outputs[0]
+
+    # DO not support TP here
+
+    logits = None
+    loss = None
+    log_probs = None
+    entropy = None
+
+    # if self.training and fuse_entropy_logprobs:
+    # NOTE: dp_actor will always need log_probs and entropy
+    if fuse_entropy_logprobs:
+        # TOCHECK: whether labels is not None is needed
+        """
+        To Squeeze:
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            
+            logits = self.lm_head(hidden_states[:, slice_indices, :])
+        
+            logits_rmpad = logits.squeeze(0)  # (total_nnz, vocab_size)
+            logits_rmpad.div_(temperature)
+            # compute entropy
+            entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+            # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
+            log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
+        """
+        # print(f"now, it will go to linear_cross_entropy")
+        # print(f"hidden_states: {hidden_states.shape, hidden_states.dim()}")
+        # print(f"self.lm_head.weight: {self.lm_head.weight.shape, self.lm_head.weight.dim()}")
+        # print(f"labels: {labels.shape, labels.dim()}")
+        hidden_states_view = hidden_states.view(-1, hidden_states.size(-1))
+        weight_view = self.lm_head.weight
+        set_backward_method(BackwardEnum._Total_Fuse_MN)
+        log_probs, entropy = linear_cross_entropy(hidden_states_view, weight_view, labels, "none")
+    else:
+        # Inferencce mode
+        logits = self.lm_head(hidden_states)
+        # loss is not needed
+        # if labels is not None:
+        #     loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+
+    if not return_dict:
+        output = (logits,) + outputs[1:]
+        return ((loss,) + output) if loss is not None else output
+
+    return FusedCausalLMOutputWithPast(
+        loss=loss,
+        logits=logits,
+        log_probs=log_probs,
+        entropy=entropy,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+    )

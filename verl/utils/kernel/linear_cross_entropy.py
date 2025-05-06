@@ -54,6 +54,7 @@ class LinearCrossEntropy(torch.autograd.Function):
             ctx.save_for_backward(hidden, weight, labels, _maximum, _accumulate, _entropy_b)
             ctx.REDUCTION = REDUCTION
             ctx.dist_process_group = dist_process_group
+            ctx.should_return_fp32_grad = False
         return logprobs, entropy
 
     @staticmethod
@@ -62,9 +63,11 @@ class LinearCrossEntropy(torch.autograd.Function):
             (hidden, weight, labels, _maximum, _accumulate, _entropy_b) = ctx.saved_tensors
             REDUCTION = ctx.REDUCTION
             dist_process_group = ctx.dist_process_group
+            should_return_fp32_grad = ctx.should_return_fp32_grad
 
             d_hidden, d_weight = kernels.efficient_entropy_backward(dlogprobs, dentropy, hidden, weight, labels,
                                                                     _maximum, _accumulate, _entropy_b, REDUCTION,
+                                                                    should_return_fp32_grad,
                                                                     dist_process_group)
 
         return (d_hidden, d_weight, None, None, None)

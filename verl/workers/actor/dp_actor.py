@@ -44,6 +44,10 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+# FIXME: please remove these
+import os
+
+
 class DataParallelPPOActor(BasePPOActor):
     def __init__(self, config, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
         """When optimizer is None, it is Reference Policy"""
@@ -82,6 +86,10 @@ class DataParallelPPOActor(BasePPOActor):
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
 
+            # FIXME:
+            rank = int(os.getenv("RANK"))
+            local_rank = int(os.getenv("LOCAL_RANK"))
+
             if self.use_remove_padding:
                 input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
@@ -101,7 +109,31 @@ class DataParallelPPOActor(BasePPOActor):
                     input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(input_ids_rmpad_rolled, None, self.ulysses_sequence_parallel_size)
 
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
-
+                
+                # FIXME: Inspect the actor_module to understand its parameters
+                # import inspect
+                # if rank == 0:
+                #     # self.actor_module is an instance of FullyShardedDataParallel
+                #     # Get the wrapped module
+                #     wrapped_module = self.actor_module.module
+                #     # Check the source of the forward method
+                #     if hasattr(wrapped_module, 'forward'):
+                #         forward_source = inspect.getsource(wrapped_module.forward)
+                #         print(f"Forward method source:\n{forward_source}")
+                #     else:
+                #         print("No forward method found in wrapped_module")
+                    
+                #     # Also check if there's a parent class with a forward method
+                #     for base_class in wrapped_module.__class__.__mro__[1:]:
+                #         if hasattr(base_class, 'forward'):
+                #             print(f"Found forward method in parent class: {base_class.__name__}")
+                #             try:
+                #                 parent_forward_source = inspect.getsource(base_class.forward)
+                #                 print(f"Parent forward method source:\n{parent_forward_source[:500]}...")
+                #             except (TypeError, OSError):
+                #                 print(f"Could not get source for {base_class.__name__}.forward")
+                #             break
+                
                 # only pass input_ids and position_ids to enable flash_attn_varlen
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
@@ -112,7 +144,11 @@ class DataParallelPPOActor(BasePPOActor):
                 )  # prevent model thinks we are generating
                 logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
 
-                logits_rmpad.div_(temperature)
+                if  self.fuse_entropy_logprobs:
+                    # the wrapped actor module has been replaced with fused version
+                    # log_probs and entropy are already computed in the fused version
+                    log_probs = output.log_probs # [bsz * response_len]
+                    entropy_rmpad = output.entropy # [bsz * response_len]
 
                 # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                 inplace_backward = True
@@ -155,6 +191,21 @@ class DataParallelPPOActor(BasePPOActor):
                 if calculate_entropy:
                     entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
+                logits.div_(temperature)
+                if rank == 0:
+                    print(f"logits.div_(temperature).shape: {logits.shape}, dtype: {logits.dtype}")
+                
+                logits = logits[:, -response_length - 1:-1, :]  # (bsz, response_length, vocab_size)
+                if rank == 0:
+                    print(f"logits.shape: {logits.shape}, dtype: {logits.dtype}")
+                
+                log_probs = logprobs_from_logits(logits, micro_batch['responses'])
+                if rank == 0:
+                    print(f"log_probs.shape: {log_probs.shape}, dtype: {log_probs.dtype}")
+
+                entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                if rank == 0:
+                    print(f"entropy.shape: {entropy.shape}, dtype: {entropy.dtype}")
             return entropy, log_probs
 
     def _optimizer_step(self):

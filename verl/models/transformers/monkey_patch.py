@@ -126,6 +126,17 @@ def apply_monkey_patch(model: PreTrainedModel, ulysses_sp_size: int):
         Qwen2_5_VLFlashAttention2.forward = ulysses_flash_attn_forward
         print("Monkey patch FlashAttention2.forward in Qwen2VL")
         return
+    elif model.config.model_type in ("llama", "qwen2"):
+        from verl.models.transformers.qwen2 import qwen2_fused_forward
+        # from verl.models.transformers.llama import llama_fused_forward
+
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
+        from transformers.models.llama.modeling_llama import LlamaForCausalLM
+
+        # LlamaForCausalLM.forward = llama_fused_forward
+        Qwen2ForCausalLM.forward = qwen2_fused_forward
+
+        print("Monkey patch forward in Qwen2 and Llama")
 
     # transformers<=4.47.1
     if hasattr(module, "_flash_attention_forward"):
