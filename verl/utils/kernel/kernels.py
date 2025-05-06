@@ -826,7 +826,7 @@ def efficient_entropy_backward(
     if _config._backward == BackwardEnum._Total_Fuse_MN or should_return_fp32_grad:
         d_hidden = torch.zeros_like(hidden, dtype=torch.float32, device=hidden.device)
         d_weight = torch.zeros_like(weight, dtype=torch.float32, device=weight.device)
-    elif _config._backward == BackwardEnum._Total_Separate:
+    else:
         d_hidden = torch.empty_like(hidden, dtype=hidden.dtype, device=hidden.device)
         d_weight = torch.empty_like(weight, dtype=hidden.dtype, device=weight.device)
     assert d_hidden.is_contiguous() and d_weight.is_contiguous()
@@ -914,8 +914,29 @@ def efficient_entropy_backward(
                 _d_logits.stride(0),
                 _d_logits.stride(1),
             )
+
+            _d_logits_t = _d_logits.T.contiguous()
+            torch.matmul(_d_logits, weight, out=d_hidden)
+            torch.matmul(_d_logits_t, hidden, out=d_weight)
         else:
-            lce_ext.backward_d_logits(
+            # lce_ext.backward_d_logits(
+            #     num_tokens, hidden_size, vocab_size, _rank,
+            #     hidden, hidden.stride(0), hidden.stride(1),
+            #     weight, weight.stride(0), weight.stride(1),
+            #     labels, labels.stride(0),
+            #     maximum, maximum.stride(0),
+            #     acc, acc.stride(0),
+            #     entropy_b, entropy_b.stride(0),
+            #     dentropy, dentropy.stride(0),
+            #     dlogprobs, dlogprobs.stride(0),
+            #     _d_logits, _d_logits.stride(0), _d_logits.stride(1),
+            #     None,
+            # )
+            # _d_logits_t = _d_logits.T.contiguous()
+            # torch.matmul(_d_logits, weight, out=d_hidden)
+            # torch.matmul(_d_logits_t, hidden, out=d_weight)
+
+            lce_ext.backward_d_logits_and_cublas_matmul(
                 num_tokens, hidden_size, vocab_size, _rank,
                 hidden, hidden.stride(0), hidden.stride(1),
                 weight, weight.stride(0), weight.stride(1),
@@ -926,10 +947,8 @@ def efficient_entropy_backward(
                 dentropy, dentropy.stride(0),
                 dlogprobs, dlogprobs.stride(0),
                 _d_logits, _d_logits.stride(0), _d_logits.stride(1),
-                None,
-            )
+                d_hidden, d_hidden.stride(0), d_hidden.stride(1),
+                d_weight, d_weight.stride(0), d_weight.stride(1),
+                None)
 
-        _d_logits_t = _d_logits.T.contiguous()
-        torch.matmul(_d_logits, weight, out=d_hidden)
-        torch.matmul(_d_logits_t, hidden, out=d_weight)
     return d_hidden, d_weight

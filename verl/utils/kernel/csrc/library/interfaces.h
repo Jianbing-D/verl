@@ -24,6 +24,16 @@ namespace lce {
         }                                                                                        \
     } while (0)
 
+#define CUBLAS_THROW(cmd)                                                                               \
+    do {                                                                                                \
+        cublasStatus_t err = (cmd);                                                                     \
+        if (err != CUBLAS_STATUS_SUCCESS) {                                                             \
+            throw std::runtime_error(std::string("CUBLAS error: ") + __FILE__ + ":" +                   \
+                                     std::to_string(__LINE__) + ": " + cublasGetStatusString(err) +     \
+                                     std::string(" in ") + #cmd);                                       \
+        }                                                                                               \
+    } while (0)         
+
 
 template <typename InT, typename OutT>
 void forward_mainloop(int32_t rank,
