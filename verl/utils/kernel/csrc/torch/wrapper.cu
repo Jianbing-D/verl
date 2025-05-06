@@ -313,10 +313,99 @@ void backward_d_logits_and_cublas_matmul(int32_t num_tokens, int32_t hidden_size
                         CUBLAS_GEMM_DEFAULT));
 }
 
+void cublas_matmul_after_d_logits(int32_t num_tokens, int32_t hidden_size, int32_t vocab_size, int32_t rank,
+                                torch::Tensor &hidden, int32_t stride_hidden_m, int32_t stride_hidden_k,
+                                torch::Tensor &weight, int32_t stride_weight_n, int32_t stride_weight_k,
+                                torch::Tensor &grad_logits, int32_t stride_grad_logits_m, int32_t stride_grad_logits_n,
+                                torch::Tensor &grad_hidden, int32_t stride_grad_hidden_m, int32_t stride_grad_hidden_k,
+                                torch::Tensor &grad_weight, int32_t stride_grad_weight_n, int32_t stride_grad_weight_k) {
+    auto stream = c10::cuda::getCurrentCUDAStream(hidden.device().index());
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+
+    TORCH_CHECK(hidden.dim() == 2, "hidden must be a 2D tensor");
+    TORCH_CHECK(weight.dim() == 2, "weight must be a 2D tensor");
+    TORCH_CHECK(hidden.size(0) == num_tokens, "hidden.size(0) must be equal to num_tokens");
+    TORCH_CHECK(hidden.size(1) == hidden_size, "hidden.size(1) must be equal to hidden_size");
+    TORCH_CHECK(weight.size(0) == vocab_size, "weight.size(0) must be equal to vocab_size");
+    TORCH_CHECK(weight.size(1) == hidden_size, "weight.size(1) must be equal to hidden_size");
+    TORCH_CHECK(grad_logits.dim() == 2, "grad_logits must be a 2D tensor");
+    TORCH_CHECK(grad_logits.size(0) == num_tokens, "grad_logits.size(0) must be equal to num_tokens");
+    TORCH_CHECK(grad_logits.size(1) == vocab_size, "grad_logits.size(1) must be equal to vocab_size");
+    TORCH_CHECK(grad_hidden.dim() == 2, "grad_hidden must be a 2D tensor");
+    TORCH_CHECK(grad_hidden.size(0) == num_tokens, "grad_hidden.size(0) must be equal to num_tokens");
+    TORCH_CHECK(grad_hidden.size(1) == hidden_size, "grad_hidden.size(1) must be equal to hidden_size");
+    TORCH_CHECK(grad_weight.dim() == 2, "grad_weight must be a 2D tensor");
+    TORCH_CHECK(grad_weight.size(0) == vocab_size, "grad_weight.size(0) must be equal to vocab_size");
+    TORCH_CHECK(grad_weight.size(1) == hidden_size, "grad_weight.size(1) must be equal to hidden_size");
+
+    TORCH_CHECK(hidden.dtype() == torch::kBFloat16, "hidden must be a bfloat16 tensor");
+    TORCH_CHECK(weight.dtype() == torch::kBFloat16, "weight must be a bfloat16 tensor");
+    TORCH_CHECK(grad_logits.dtype() == torch::kBFloat16, "grad_logits must be a bfloat16 tensor");
+    TORCH_CHECK(grad_hidden.dtype() == torch::kBFloat16, "grad_hidden must be a bfloat16 tensor");
+    TORCH_CHECK(grad_weight.dtype() == torch::kBFloat16, "grad_weight must be a bfloat16 tensor");
+
+    TORCH_CHECK(hidden.is_cuda(), "hidden must be a cuda tensor");
+    TORCH_CHECK(weight.is_cuda(), "weight must be a cuda tensor");
+    TORCH_CHECK(grad_logits.is_cuda(), "grad_logits must be a cuda tensor");
+    TORCH_CHECK(grad_hidden.is_cuda(), "grad_hidden must be a cuda tensor");
+    TORCH_CHECK(grad_weight.is_cuda(), "grad_weight must be a cuda tensor");
+
+    TORCH_CHECK(hidden.is_contiguous(), "hidden must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+    TORCH_CHECK(grad_logits.is_contiguous(), "grad_logits must be contiguous");
+    TORCH_CHECK(grad_hidden.is_contiguous(), "grad_hidden must be contiguous");
+    TORCH_CHECK(grad_weight.is_contiguous(), "grad_weight must be contiguous");
+    
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    CUBLAS_THROW(cublasSetStream(handle, stream));
+    CUBLAS_THROW(cublasGemmEx(handle,
+                            CUBLAS_OP_N,
+                            CUBLAS_OP_N,
+                            hidden_size,
+                            num_tokens,
+                            vocab_size,
+                            &alpha,
+                            weight.data_ptr(),
+                            CUDA_R_16BF,
+                            hidden_size,
+                            grad_logits.data_ptr(),
+                            CUDA_R_16BF,
+                            vocab_size,
+                            &beta,
+                            grad_hidden.data_ptr(),
+                            CUDA_R_16BF,
+                            hidden_size,
+                            CUBLAS_COMPUTE_32F,
+                            CUBLAS_GEMM_DEFAULT));
+    CUBLAS_THROW(cublasGemmEx(handle,
+                                CUBLAS_OP_N,        
+                                CUBLAS_OP_T,      
+                                hidden_size,    
+                                vocab_size,      
+                                num_tokens,        
+                                &alpha,
+                                hidden.data_ptr(),  
+                                CUDA_R_16BF,
+                                hidden_size,        
+                                grad_logits.data_ptr(), 
+                                CUDA_R_16BF,
+                                vocab_size,         
+                                &beta,
+                                grad_weight.data_ptr(), 
+                                CUDA_R_16BF,
+                                hidden_size,        
+                                CUBLAS_COMPUTE_32F,
+                                CUBLAS_GEMM_DEFAULT));
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward_mainloop", &forward_mainloop, "Linear Cross Entropy Forward Mainloop");
     m.def("backward_d_logits", &backward_d_logits, "Linear Cross Entropy Backward d_logits");
     m.def("backward_d_logits_and_cublas_matmul", 
           &backward_d_logits_and_cublas_matmul, 
           "Linear Cross Entropy Backward d_logits following cublas matmul");
+    m.def("cublas_matmul_after_d_logits",
+          &cublas_matmul_after_d_logits,
+          "cublas matmul after d_logits");
 }

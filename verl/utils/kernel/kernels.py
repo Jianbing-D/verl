@@ -100,7 +100,7 @@ class BackwardEnum:
 @dataclass
 class Config:
     _backward: BackwardEnum = BackwardEnum._Total_Separate
-    _use_triton: bool = False
+    _use_triton: bool = True
 
 _config = Config()
 
@@ -915,9 +915,17 @@ def efficient_entropy_backward(
                 _d_logits.stride(1),
             )
 
-            _d_logits_t = _d_logits.T.contiguous()
-            torch.matmul(_d_logits, weight, out=d_hidden)
-            torch.matmul(_d_logits_t, hidden, out=d_weight)
+            # _d_logits_t = _d_logits.T.contiguous()
+            # torch.matmul(_d_logits, weight, out=d_hidden)
+            # torch.matmul(_d_logits_t, hidden, out=d_weight)
+            lce_ext.cublas_matmul_after_d_logits(
+                num_tokens, hidden_size, vocab_size, _rank,
+                hidden, hidden.stride(0), hidden.stride(1),
+                weight, weight.stride(0), weight.stride(1),
+                _d_logits, _d_logits.stride(0), _d_logits.stride(1),
+                d_hidden, d_hidden.stride(0), d_hidden.stride(1),
+                d_weight, d_weight.stride(0), d_weight.stride(1),
+            )
         else:
             # lce_ext.backward_d_logits(
             #     num_tokens, hidden_size, vocab_size, _rank,
