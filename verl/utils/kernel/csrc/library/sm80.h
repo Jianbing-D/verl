@@ -1217,7 +1217,8 @@ __global__ void backward_d_logits_kernel(int32_t num_tokens,
                                         + pid_n * Traits::tileN
                                         + rank * vocab_size;
                 float tmp = __fmaf_ieee_rn(exp_logit, accu_rcp, -1.0f * (sLabels(m_idx, Int<0>{}) == global_n_idx));
-                float d_logit = sGradLogprobs(m_idx, Int<0>{}) * tmp;
+                // negate on grad_logprobs
+                float d_logit = (-1.0f * sGradLogprobs(m_idx, Int<0>{})) * tmp;
                 d_logit += sGradEntropy(m_idx, Int<0>{}) * (-1.0f * exp_logit * accu_rcp) * (tMMArLogit(k, m, n) - sEntropyB(m_idx, Int<0>{}));
 
                 tMMArLogit(k, m, n) = d_logit;
