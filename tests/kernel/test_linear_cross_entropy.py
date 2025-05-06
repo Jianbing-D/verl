@@ -175,11 +175,9 @@ class TestLinearCrossEntropy:
 
     def generate_hyper(self):
         self.num_tokens = 13092
-        # self.num_tokens = 80
         self.hidden_size = 4096
         self.vocab_size = 152064
-        self.dtype = torch.float32
-        # self.dtype = torch.bfloat16
+        self.dtype = torch.bfloat16
 
     def generate_forward_inputs(self):
         hidden = (torch.empty((self.num_tokens, self.hidden_size), dtype=self.dtype,
@@ -348,12 +346,11 @@ class TestLinearCrossEntropy_TensorParallel:
         torch.cuda.synchronize()
 
     def generate_hyper(self):
-        # self.num_tokens = 13092
-        self.num_tokens = 80
+        self.num_tokens = 13092
+        # self.num_tokens = 80
         self.hidden_size = 4096
         self.vocab_size = 152064
         self.dtype = torch.bfloat16
-        # self.dtype = torch.float32
         self.iterations = 5
 
     def generate_forward_inputs(self):
@@ -594,7 +591,7 @@ if __name__ == "__main__":
     print(f"[INFO]: Running in {'distributed' if is_distributed else 'non-distributed'} mode")
     torch.manual_seed(233376 + int(os.environ.get("RANK", 0)))
 
-    set_backward_method(BackwardEnum._Total_Fuse_MN)
+    # set_backward_method(BackwardEnum._Total_Fuse_MN)
 
     if not is_distributed:
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):

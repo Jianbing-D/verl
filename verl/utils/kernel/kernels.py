@@ -39,6 +39,13 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
+import os
+import sys
+ext_path = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
+                                        "./csrc/torch/"))
+sys.path.append(ext_path)
+import linear_cross_entropy_extension as lce_ext
+
 
 @dataclass
 class EntropyReductionEnum:
@@ -90,16 +97,21 @@ class BackwardEnum:
     _Total_Fuse_MN = 0  # Fuse d_logits & d_hidden & d_weight, no intermediate storage, requires fp32 for d_hidden & d_weight
     _Total_Separate = 1  # Store d_logits, no special requirements for d_hidden & d_weight
 
+@dataclass
+class Config:
+    _backward: BackwardEnum = BackwardEnum._Total_Separate
+    _use_triton: bool = False
 
-_BACKWARD: BackwardEnum = BackwardEnum._Total_Separate
+_config = Config()
+
 
 
 def set_backward_method(backward_method: BackwardEnum):
     """
     Set the backward method.
     """
-    global _BACKWARD
-    _BACKWARD = backward_method
+    global _config
+    _config._backward = backward_method
 
 
 @triton.autotune(
@@ -464,16 +476,28 @@ def efficient_entropy_forward(
     assert _accu.is_contiguous() and _entropy_b.is_contiguous() and _max.is_contiguous()
     assert _accu.is_cuda and _entropy_b.is_cuda and _max.is_cuda
 
-    # 1D kernel launch, then split the tile
-    def mainloop_grid(meta):
-        return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]) * num_splits,)
-    efficient_entropy_kernel_general_mainloop[mainloop_grid](_rank, hidden, weight, labels, num_tokens, hidden_size,
-                                                             vocab_size, vocab_per_split, hidden.stride(0),
-                                                             hidden.stride(1), weight.stride(0), weight.stride(1), _max,
-                                                             _max.stride(0), _max.stride(1), _accu, _accu.stride(0),
-                                                             _accu.stride(1), _entropy_b, _entropy_b.stride(0),
-                                                             _entropy_b.stride(1), _logprobs, _logprobs.stride(0),
-                                                             logprobs)
+    if _config._use_triton:
+        # 1D kernel launch, then split the tile
+        def mainloop_grid(meta):
+            return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]) * num_splits,)
+        efficient_entropy_kernel_general_mainloop[mainloop_grid](_rank, hidden, weight, labels, num_tokens, hidden_size,
+                                                                vocab_size, vocab_per_split, hidden.stride(0),
+                                                                hidden.stride(1), weight.stride(0), weight.stride(1), _max,
+                                                                _max.stride(0), _max.stride(1), _accu, _accu.stride(0),
+                                                                _accu.stride(1), _entropy_b, _entropy_b.stride(0),
+                                                                _entropy_b.stride(1), _logprobs, _logprobs.stride(0),
+                                                                logprobs)
+    else:
+        lce_ext.forward_mainloop(hidden, hidden.stride(0), hidden.stride(1),
+                                weight, weight.stride(0), weight.stride(1),
+                                labels, labels.stride(0),
+                                _rank,
+                                num_tokens, vocab_size, hidden_size,
+                                vocab_per_split,
+                                _max, _max.stride(0), _max.stride(1),
+                                _accu, _accu.stride(0), _accu.stride(1),
+                                _entropy_b, _entropy_b.stride(0), _entropy_b.stride(1),
+                                _logprobs, logprobs, None)
 
     # reduction on maximum and maximum_indices
     def epilogue_grid(meta):
@@ -799,10 +823,10 @@ def efficient_entropy_backward(
     assert dentropy.shape == (num_tokens,)
 
     d_hidden, d_weight = None, None
-    if _BACKWARD == BackwardEnum._Total_Fuse_MN or should_return_fp32_grad:
+    if _config._backward == BackwardEnum._Total_Fuse_MN or should_return_fp32_grad:
         d_hidden = torch.zeros_like(hidden, dtype=torch.float32, device=hidden.device)
         d_weight = torch.zeros_like(weight, dtype=torch.float32, device=weight.device)
-    elif _BACKWARD == BackwardEnum._Total_Separate:
+    elif _config._backward == BackwardEnum._Total_Separate:
         d_hidden = torch.empty_like(hidden, dtype=hidden.dtype, device=hidden.device)
         d_weight = torch.empty_like(weight, dtype=hidden.dtype, device=weight.device)
     assert d_hidden.is_contiguous() and d_weight.is_contiguous()
@@ -819,8 +843,7 @@ def efficient_entropy_backward(
     assert entropy_b.is_contiguous() and entropy_b.is_cuda
     assert entropy_b.shape == (num_tokens,)
 
-    if _BACKWARD == BackwardEnum._Total_Fuse_MN:
-
+    if _config._backward == BackwardEnum._Total_Fuse_MN:
         def mainloop_grid(meta):
             return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]) * triton.cdiv(vocab_size, meta["BLOCK_SIZE_N"]),)
 
@@ -855,49 +878,56 @@ def efficient_entropy_backward(
             d_weight.stride(0),
             d_weight.stride(1),
         )
-    elif _BACKWARD == BackwardEnum._Total_Separate:
+    elif _config._backward == BackwardEnum._Total_Separate:
         _d_logits = torch.empty((num_tokens, vocab_size), device=hidden.device, dtype=hidden.dtype).contiguous()
         assert _d_logits.is_contiguous()
 
-        def d_logits_grid(meta):
-            return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]) * triton.cdiv(vocab_size, meta["BLOCK_SIZE_N"]),)
+        if _config._use_triton:
+            def d_logits_grid(meta):
+                return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]) * triton.cdiv(vocab_size, meta["BLOCK_SIZE_N"]),)
 
-        efficient_entropy_backward_kernel_general_d_logits[d_logits_grid](
-            num_tokens,
-            hidden_size,
-            vocab_size,
-            _rank,
-            hidden,
-            hidden.stride(0),
-            hidden.stride(1),
-            weight,
-            weight.stride(0),
-            weight.stride(1),
-            labels,
-            labels.stride(0),
-            maximum,
-            maximum.stride(0),
-            acc,
-            acc.stride(0),
-            dentropy,
-            dentropy.stride(0),
-            dlogprobs,
-            dlogprobs.stride(0) if REDUCTION == EntropyReductionEnum._None else 0,
-            REDUCTION,
-            entropy_b,
-            entropy_b.stride(0),
-            _d_logits,
-            _d_logits.stride(0),
-            _d_logits.stride(1),
-        )
-
-        # torch.matmul(_d_logits, weight.T, out=d_hidden)
-        # torch.matmul(hidden.T, _d_logits, out=d_weight)
-        # print(f"d_logits.dtype: {_d_logits.dtype}")
-        # print(f"weight.dtype: {weight.dtype}")
-        # print(f"d_hidden.dtype: {d_hidden.dtype}")
-        # print(f"d_weight.dtype: {d_weight.dtype}")
-        # print(f"hidden.dtype: {hidden.dtype}")
+            efficient_entropy_backward_kernel_general_d_logits[d_logits_grid](
+                num_tokens,
+                hidden_size,
+                vocab_size,
+                _rank,
+                hidden,
+                hidden.stride(0),
+                hidden.stride(1),
+                weight,
+                weight.stride(0),
+                weight.stride(1),
+                labels,
+                labels.stride(0),
+                maximum,
+                maximum.stride(0),
+                acc,
+                acc.stride(0),
+                dentropy,
+                dentropy.stride(0),
+                dlogprobs,
+                dlogprobs.stride(0) if REDUCTION == EntropyReductionEnum._None else 0,
+                REDUCTION,
+                entropy_b,
+                entropy_b.stride(0),
+                _d_logits,
+                _d_logits.stride(0),
+                _d_logits.stride(1),
+            )
+        else:
+            lce_ext.backward_d_logits(
+                num_tokens, hidden_size, vocab_size, _rank,
+                hidden, hidden.stride(0), hidden.stride(1),
+                weight, weight.stride(0), weight.stride(1),
+                labels, labels.stride(0),
+                maximum, maximum.stride(0),
+                acc, acc.stride(0),
+                entropy_b, entropy_b.stride(0),
+                dentropy, dentropy.stride(0),
+                dlogprobs, dlogprobs.stride(0),
+                _d_logits, _d_logits.stride(0), _d_logits.stride(1),
+                None,
+            )
 
         _d_logits_t = _d_logits.T.contiguous()
         torch.matmul(_d_logits, weight, out=d_hidden)
