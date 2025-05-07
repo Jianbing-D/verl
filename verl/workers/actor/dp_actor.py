@@ -64,6 +64,7 @@ class DataParallelPPOActor(BasePPOActor):
             if self.config.get("use_torch_compile", True)  #  use torch compile by default
             else verl_F.entropy_from_logits
         )
+        self.fuse_entropy_logprobs = self.config.get("fuse_entropy_logprobs", False)
 
     def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -141,24 +142,27 @@ class DataParallelPPOActor(BasePPOActor):
                     position_ids=position_ids_rmpad,
                     **multi_modal_inputs,
                     use_cache=False,
+                    # additional parameters for fused version
+                    fuse_entropy_logprobs=self.fuse_entropy_logprobs,
+                    labels=input_ids_rmpad_rolled,
+                    temperature=temperature,
                 )  # prevent model thinks we are generating
-                logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
-
                 if  self.fuse_entropy_logprobs:
                     # the wrapped actor module has been replaced with fused version
                     # log_probs and entropy are already computed in the fused version
                     log_probs = output.log_probs # [bsz * response_len]
                     entropy_rmpad = output.entropy # [bsz * response_len]
+                else:
+                    logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                    # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
+                    inplace_backward = True
+                    if calculate_entropy:
+                        inplace_backward = False
+                    log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled, inplace_backward=inplace_backward)
 
-                # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                inplace_backward = True
-                if calculate_entropy:
-                    inplace_backward = False
-                log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled, inplace_backward=inplace_backward)
-
-                # compute entropy
-                if calculate_entropy:
-                    entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+                    # compute entropy
+                    if calculate_entropy:
+                        entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
 
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
