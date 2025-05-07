@@ -29,7 +29,8 @@ namespace lce {
         cublasStatus_t err = (cmd);                                                                     \
         if (err != CUBLAS_STATUS_SUCCESS) {                                                             \
             throw std::runtime_error(std::string("CUBLAS error: ") + __FILE__ + ":" +                   \
-                                     std::to_string(__LINE__) + ": " + cublasGetStatusString(err) +     \
+                                     std::to_string(__LINE__) + ": [" + cublasGetStatusName(err)        \
+                                     + "]: " + cublasGetStatusString(err) +                             \
                                      std::string(" in ") + #cmd);                                       \
         }                                                                                               \
     } while (0)         
