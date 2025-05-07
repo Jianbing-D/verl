@@ -302,7 +302,7 @@ def qwen2_fused_forward(
         # print(f"labels: {labels.shape, labels.dim()}")
         hidden_states_view = hidden_states.view(-1, hidden_states.size(-1))
         weight_view = self.lm_head.weight
-        set_backward_method(BackwardEnum._Total_Fuse_MN)
+        # set_backward_method(BackwardEnum._Total_Fuse_MN)
         log_probs, entropy = linear_cross_entropy(hidden_states_view, weight_view, labels, "none")
     else:
         # Inferencce mode
