@@ -96,6 +96,8 @@ class BackwardEnum:
     """
     _Total_Fuse_MN = 0  # Fuse d_logits & d_hidden & d_weight, no intermediate storage, requires fp32 for d_hidden & d_weight
     _Total_Separate = 1  # Store d_logits, no special requirements for d_hidden & d_weight
+    _Split_Dlogits_N = 2 # split d_logits along its N dimension, aka. vocab_size
+    _Split_Dlogits_M = 3 # split d_logits along its M dimension, aka. num_tokens
 
 @dataclass
 class Config:
@@ -983,6 +985,98 @@ def efficient_entropy_backward_kernel_general_d_logits(
              mask=(offs_am[:, None] < num_tokens) & (offs_bn[None, :] < vocab_size))
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 32,
+            "GROUP_SIZE_M": 16
+        },
+                      num_stages=3,
+                      num_warps=8),
+    ],
+    key=["num_tokens", "hidden_size", "vocab_size"],
+)
+@triton.jit
+def efficient_entropy_backward_kernel_general_d_logits_split_N(
+        split_idx: int,
+        num_tokens: int, hidden_size: int, vocab_size: int, vocab_per_split: int, rank: int, 
+        hidden_ptr, stride_hidden_m: tl.int64, stride_hidden_k: tl.int64,
+        weight_ptr, stride_weight_n: tl.int64, stride_weight_k: tl.int64, 
+        labels_ptr, stride_labels: tl.int64, 
+        maximum_ptr, stride_maximum: tl.int64, 
+        accu_ptr, stride_accu: tl.int64, 
+        d_entropy_ptr, stride_d_entropy: tl.int64, 
+        d_logprobs_ptr, stride_d_logprobs: tl.int64, reduction: int, 
+        entropy_b_ptr, stride_entropy_b, 
+        d_logits_ptr, stride_d_logits_m: tl.int64, stride_d_logits_n: tl.int64, 
+        rcp_temperature: tl.float32,
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(num_tokens, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(vocab_per_split, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = split_idx * vocab_per_split + pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    maximum = tl.load(maximum_ptr + offs_am * stride_maximum, mask=offs_am < num_tokens, other=0.0)
+    accu = tl.load(accu_ptr + offs_am * stride_accu, mask=offs_am < num_tokens, other=1e-6)
+    accu_rcp = tl.fdiv(1.0, accu)
+    d_entropy = tl.load(d_entropy_ptr + offs_am * stride_d_entropy, mask=offs_am < num_tokens, other=0.0)
+    if reduction == 0:
+        d_logprobs = tl.load(d_logprobs_ptr + offs_am * stride_d_logprobs, mask=offs_am < num_tokens, other=0.0)
+    elif reduction == 1:
+        d_logprobs = tl.load(d_logprobs_ptr)
+        d_logprobs = tl.broadcast_to(d_logprobs, (BLOCK_SIZE_M,))
+    else:
+        d_logprobs = tl.fdiv(tl.load(d_logprobs_ptr), num_tokens.to(tl.float32))
+        d_logprobs = tl.broadcast_to(d_logprobs, (BLOCK_SIZE_M,))
+    d_logprobs = -1 * d_logprobs
+    entropy_b = tl.load(entropy_b_ptr + offs_am * stride_entropy_b, mask=offs_am < num_tokens, other=0.0)
+    labels = tl.load(labels_ptr + offs_am * stride_labels, mask=offs_am < num_tokens, other=0)
+
+    hidden_ptrs = hidden_ptr + (offs_am[:, None] * stride_hidden_m + offs_k[None, :] * stride_hidden_k)
+    weight_ptrs = weight_ptr + (offs_bn[:, None] * stride_weight_n + offs_k[None, :] * stride_weight_k)
+
+    vocab_right_bound = min((split_idx + 1) * vocab_per_split, vocab_size)
+    logits = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(hidden_size, BLOCK_SIZE_K)):
+        _hidden = tl.load(hidden_ptrs,
+                          mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_am[:, None] < num_tokens),
+                          other=0.0)
+        _weight = tl.load(weight_ptrs,
+                          mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_bn[:, None] < vocab_right_bound),
+                          other=0.0)
+        logits = tl.dot(_hidden, _weight.trans(), logits)
+
+        hidden_ptrs += BLOCK_SIZE_K * stride_hidden_k
+        weight_ptrs += BLOCK_SIZE_K * stride_weight_k
+
+    logits *= rcp_temperature
+    exp_logits = tl.exp(logits - maximum[:, None])
+
+    mask = (offs_bn + rank * vocab_size)[None, :] == labels[:, None]
+    d_logits = d_logprobs[:, None] * (exp_logits * accu_rcp[:, None] - mask)
+    d_logits += d_entropy[:, None] * (-exp_logits * accu_rcp[:, None]) * (logits - entropy_b[:, None])
+    
+    d_logits *= rcp_temperature
+
+    # filter d_logits with mask
+    result_offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    mask = (offs_am[:, None] < num_tokens) & (result_offs_n[None, :] < vocab_per_split)
+
+    tl.store(d_logits_ptr + offs_am[:, None] * stride_d_logits_m + result_offs_n[None, :] * stride_d_logits_n,
+             d_logits, mask)
+
+
 def efficient_entropy_backward(
         dlogprobs: torch.Tensor,
         dentropy: torch.Tensor,
@@ -1028,10 +1122,8 @@ def efficient_entropy_backward(
 
     d_hidden, d_weight = None, None
     if _config._backward == BackwardEnum._Total_Fuse_MN or should_return_fp32_grad:
-        # d_hidden = torch.zeros_like(hidden, dtype=torch.float32, device=hidden.device)
-        # d_weight = torch.zeros_like(weight, dtype=torch.float32, device=weight.device)
-        d_hidden = torch.empty_like(hidden, dtype=hidden.dtype, device=hidden.device)
-        d_weight = torch.empty_like(weight, dtype=weight.dtype, device=weight.device)
+        d_hidden = torch.zeros_like(hidden, dtype=torch.float32, device=hidden.device)
+        d_weight = torch.zeros_like(weight, dtype=torch.float32, device=weight.device)
     else:
         d_hidden = torch.empty_like(hidden, dtype=hidden.dtype, device=hidden.device)
         d_weight = torch.empty_like(weight, dtype=hidden.dtype, device=weight.device)
@@ -1051,41 +1143,41 @@ def efficient_entropy_backward(
 
     if _config._backward == BackwardEnum._Total_Fuse_MN:
         # --- Triton doesn't materialize d_logits at all. Split tiles at the perspective of d_logits.
-        # def mainloop_grid(meta):
-        #     return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]) * triton.cdiv(vocab_size, meta["BLOCK_SIZE_N"]),)
+        def mainloop_grid(meta):
+            return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]) * triton.cdiv(vocab_size, meta["BLOCK_SIZE_N"]),)
 
-        # efficient_entropy_backward_kernel_general_mainloop_MN[mainloop_grid](
-        #     num_tokens,
-        #     hidden_size,
-        #     vocab_size,
-        #     _rank,
-        #     hidden,
-        #     hidden.stride(0),
-        #     hidden.stride(1),
-        #     weight,
-        #     weight.stride(0),
-        #     weight.stride(1),
-        #     labels,
-        #     labels.stride(0),
-        #     maximum,
-        #     maximum.stride(0),
-        #     acc,
-        #     acc.stride(0),
-        #     dentropy,
-        #     dentropy.stride(0),
-        #     dlogprobs,
-        #     dlogprobs.stride(0) if REDUCTION == EntropyReductionEnum._None else 0,
-        #     REDUCTION,
-        #     entropy_b,
-        #     entropy_b.stride(0),
-        #     d_hidden,
-        #     d_hidden.stride(0),
-        #     d_hidden.stride(1),
-        #     d_weight,
-        #     d_weight.stride(0),
-        #     d_weight.stride(1),
-        #     1.0 / temperature,
-        # )
+        efficient_entropy_backward_kernel_general_mainloop_MN[mainloop_grid](
+            num_tokens,
+            hidden_size,
+            vocab_size,
+            _rank,
+            hidden,
+            hidden.stride(0),
+            hidden.stride(1),
+            weight,
+            weight.stride(0),
+            weight.stride(1),
+            labels,
+            labels.stride(0),
+            maximum,
+            maximum.stride(0),
+            acc,
+            acc.stride(0),
+            dentropy,
+            dentropy.stride(0),
+            dlogprobs,
+            dlogprobs.stride(0) if REDUCTION == EntropyReductionEnum._None else 0,
+            REDUCTION,
+            entropy_b,
+            entropy_b.stride(0),
+            d_hidden,
+            d_hidden.stride(0),
+            d_hidden.stride(1),
+            d_weight,
+            d_weight.stride(0),
+            d_weight.stride(1),
+            1.0 / temperature,
+        )
 
         # def grad_hidden_grid(meta):
         #     return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]) * triton.cdiv(hidden_size, meta["BLOCK_SIZE_K"]),)
@@ -1119,37 +1211,37 @@ def efficient_entropy_backward(
         #     1.0 / temperature,
         # )
 
-        def grad_weight_grid(meta):
-            return (triton.cdiv(vocab_size, meta["BLOCK_SIZE_N"]) * triton.cdiv(hidden_size, meta["BLOCK_SIZE_K"]),)
-        efficient_entropy_backward_kernel_d_weight[grad_weight_grid](
-            num_tokens,
-            hidden_size,
-            vocab_size,
-            _rank,
-            hidden,
-            hidden.stride(0),
-            hidden.stride(1),
-            weight,
-            weight.stride(0),
-            weight.stride(1),
-            labels,
-            labels.stride(0),
-            maximum,
-            maximum.stride(0),
-            acc,
-            acc.stride(0),
-            dentropy,
-            dentropy.stride(0),
-            dlogprobs,
-            dlogprobs.stride(0) if REDUCTION == EntropyReductionEnum._None else 0,
-            REDUCTION,
-            entropy_b,
-            entropy_b.stride(0),
-            d_weight,
-            d_weight.stride(0),
-            d_weight.stride(1),
-            1.0 / temperature,
-        )
+        # def grad_weight_grid(meta):
+        #     return (triton.cdiv(vocab_size, meta["BLOCK_SIZE_N"]) * triton.cdiv(hidden_size, meta["BLOCK_SIZE_K"]),)
+        # efficient_entropy_backward_kernel_d_weight[grad_weight_grid](
+        #     num_tokens,
+        #     hidden_size,
+        #     vocab_size,
+        #     _rank,
+        #     hidden,
+        #     hidden.stride(0),
+        #     hidden.stride(1),
+        #     weight,
+        #     weight.stride(0),
+        #     weight.stride(1),
+        #     labels,
+        #     labels.stride(0),
+        #     maximum,
+        #     maximum.stride(0),
+        #     acc,
+        #     acc.stride(0),
+        #     dentropy,
+        #     dentropy.stride(0),
+        #     dlogprobs,
+        #     dlogprobs.stride(0) if REDUCTION == EntropyReductionEnum._None else 0,
+        #     REDUCTION,
+        #     entropy_b,
+        #     entropy_b.stride(0),
+        #     d_weight,
+        #     d_weight.stride(0),
+        #     d_weight.stride(1),
+        #     1.0 / temperature,
+        # )
 
     elif _config._backward == BackwardEnum._Total_Separate:
         _d_logits = torch.empty((num_tokens, vocab_size), device=hidden.device, dtype=hidden.dtype).contiguous()
@@ -1232,5 +1324,82 @@ def efficient_entropy_backward(
                 d_hidden, d_hidden.stride(0), d_hidden.stride(1),
                 d_weight, d_weight.stride(0), d_weight.stride(1),
                 None)
+
+    elif _config._backward == BackwardEnum._Split_Dlogits_N:
+        vocab_per_split = 9504
+        num_splits = (vocab_size + vocab_per_split - 1) // vocab_per_split
+
+        _d_logits = torch.empty((num_tokens, vocab_per_split), device=hidden.device, dtype=hidden.dtype).contiguous()
+        assert _d_logits.is_contiguous()
+
+        def d_logits_grid(meta):
+            return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]) * triton.cdiv(vocab_per_split, meta["BLOCK_SIZE_N"]),)
+        
+        for split_idx in range(num_splits):
+            efficient_entropy_backward_kernel_general_d_logits_split_N[d_logits_grid](
+                split_idx,
+                num_tokens,
+                hidden_size,
+                vocab_size,
+                vocab_per_split,
+                _rank,
+                hidden,
+                hidden.stride(0),
+                hidden.stride(1),
+                weight,
+                weight.stride(0),
+                weight.stride(1),
+                labels,
+                labels.stride(0),
+                maximum,
+                maximum.stride(0),
+                acc,
+                acc.stride(0),
+                dentropy,
+                dentropy.stride(0),
+                dlogprobs,
+                dlogprobs.stride(0) if REDUCTION == EntropyReductionEnum._None else 0,
+                REDUCTION,
+                entropy_b,
+                entropy_b.stride(0),
+                _d_logits,
+                _d_logits.stride(0),
+                _d_logits.stride(1),
+                1.0 / temperature,
+            )
+
+            vocab_right_bound = min((split_idx + 1) * vocab_per_split, vocab_size) - split_idx * vocab_per_split
+            _d_logits = _d_logits[:, :vocab_right_bound].contiguous()
+
+            if split_idx == 0:
+                torch.matmul(_d_logits, 
+                             weight[split_idx * vocab_per_split : (split_idx + 1) * vocab_per_split, :], 
+                             out=d_hidden)
+            else:
+                d_hidden += torch.matmul(_d_logits, 
+                                         weight[split_idx * vocab_per_split : (split_idx + 1) * vocab_per_split, :])
+            torch.matmul(_d_logits.T, 
+                         hidden, 
+                         out=d_weight[split_idx * vocab_per_split : (split_idx + 1) * vocab_per_split, :])
+
+            
+            # lce_ext.cublas_matmul_after_d_logits(
+            #     num_tokens, hidden_size, vocab_right_bound, _rank,
+            #     hidden, hidden.stride(0), hidden.stride(1),
+            #     weight[split_idx * vocab_per_split : (split_idx + 1) * vocab_per_split, :], 
+            #     weight[split_idx * vocab_per_split : (split_idx + 1) * vocab_per_split, :].stride(0), 
+            #     weight[split_idx * vocab_per_split : (split_idx + 1) * vocab_per_split, :].stride(1),
+            #     _d_logits,
+            #     _d_logits.stride(0),
+            #     _d_logits.stride(1),
+            #     d_hidden, d_hidden.stride(0), d_hidden.stride(1),
+            #     d_weight[split_idx * vocab_per_split : (split_idx + 1) * vocab_per_split, :],
+            #     d_weight[split_idx * vocab_per_split : (split_idx + 1) * vocab_per_split, :].stride(0),
+            #     d_weight[split_idx * vocab_per_split : (split_idx + 1) * vocab_per_split, :].stride(1),
+            #     1.0, split_idx != 0, 1.0, 0.0
+            # )
+        
+    elif _config._backward == BackwardEnum._Split_Dlogits_M:
+        raise NotImplementedError("BackwardEnum._Split_Dlogits_M is not implemented yet")
 
     return d_hidden, d_weight

@@ -318,7 +318,9 @@ void cublas_matmul_after_d_logits(int32_t num_tokens, int32_t hidden_size, int32
                                 torch::Tensor &weight, int32_t stride_weight_n, int32_t stride_weight_k,
                                 torch::Tensor &grad_logits, int32_t stride_grad_logits_m, int32_t stride_grad_logits_n,
                                 torch::Tensor &grad_hidden, int32_t stride_grad_hidden_m, int32_t stride_grad_hidden_k,
-                                torch::Tensor &grad_weight, int32_t stride_grad_weight_n, int32_t stride_grad_weight_k) {
+                                torch::Tensor &grad_weight, int32_t stride_grad_weight_n, int32_t stride_grad_weight_k,
+                                float alpha0 = 1.0f, float beta0 = 0.0f,
+                                float alpha1 = 1.0f, float beta1 = 0.0f) {
     auto stream = c10::cuda::getCurrentCUDAStream(hidden.device().index());
     cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
 
@@ -356,8 +358,6 @@ void cublas_matmul_after_d_logits(int32_t num_tokens, int32_t hidden_size, int32
     TORCH_CHECK(grad_hidden.is_contiguous(), "grad_hidden must be contiguous");
     TORCH_CHECK(grad_weight.is_contiguous(), "grad_weight must be contiguous");
     
-    float alpha = 1.0f;
-    float beta = 0.0f;
     CUBLAS_THROW(cublasSetStream(handle, stream));
     CUBLAS_THROW(cublasGemmEx(handle,
                             CUBLAS_OP_N,
@@ -365,14 +365,14 @@ void cublas_matmul_after_d_logits(int32_t num_tokens, int32_t hidden_size, int32
                             hidden_size,
                             num_tokens,
                             vocab_size,
-                            &alpha,
+                            &alpha0,
                             weight.data_ptr(),
                             CUDA_R_16BF,
                             hidden_size,
                             grad_logits.data_ptr(),
                             CUDA_R_16BF,
                             vocab_size,
-                            &beta,
+                            &beta0,
                             grad_hidden.data_ptr(),
                             CUDA_R_16BF,
                             hidden_size,
@@ -384,14 +384,14 @@ void cublas_matmul_after_d_logits(int32_t num_tokens, int32_t hidden_size, int32
     //                             hidden_size,    
     //                             vocab_size,      
     //                             num_tokens,        
-    //                             &alpha,
+    //                             &alpha1,
     //                             hidden.data_ptr(),  
     //                             CUDA_R_16BF,
     //                             hidden_size,        
     //                             grad_logits.data_ptr(), 
     //                             CUDA_R_16BF,
     //                             vocab_size,         
-    //                             &beta,
+    //                             &beta1,
     //                             grad_weight.data_ptr(), 
     //                             CUDA_R_16BF,
     //                             hidden_size,        
@@ -404,14 +404,14 @@ void cublas_matmul_after_d_logits(int32_t num_tokens, int32_t hidden_size, int32
                                hidden_size,
                                vocab_size,
                                num_tokens,
-                               &alpha,
+                               &alpha1,
                                hidden.data_ptr(),
                                CUDA_R_16BF,
                                hidden_size,
                                grad_logits.data_ptr(),
                                CUDA_R_16BF,
                                vocab_size,
-                               &beta,
+                               &beta1,
                                grad_weight.data_ptr(),
                                CUDA_R_16BF,
                                hidden_size));
