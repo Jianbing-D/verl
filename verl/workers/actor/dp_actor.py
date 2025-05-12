@@ -47,6 +47,8 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 # FIXME: please remove these
 import os
 
+from torch.profiler import profile, record_function, ProfilerActivity
+
 
 class DataParallelPPOActor(BasePPOActor):
     def __init__(self, config, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
@@ -134,7 +136,6 @@ class DataParallelPPOActor(BasePPOActor):
                 #             except (TypeError, OSError):
                 #                 print(f"Could not get source for {base_class.__name__}.forward")
                 #             break
-                
                 # only pass input_ids and position_ids to enable flash_attn_varlen
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
@@ -148,11 +149,13 @@ class DataParallelPPOActor(BasePPOActor):
                     temperature=temperature,
                 )  # prevent model thinks we are generating
                 if  self.fuse_entropy_logprobs:
+                    # print("using fused version")
                     # the wrapped actor module has been replaced with fused version
                     # log_probs and entropy are already computed in the fused version
                     log_probs = output.log_probs # [bsz * response_len]
                     entropy_rmpad = output.entropy # [bsz * response_len]
                 else:
+                    # print("using vanilla version")
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
@@ -163,6 +166,12 @@ class DataParallelPPOActor(BasePPOActor):
                     # compute entropy
                     if calculate_entropy:
                         entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+
+                print(f"log_probs.shape: {log_probs.shape}, dtype: {log_probs.dtype}")
+                if calculate_entropy:
+                    print(f"entropy_rmpad.shape: {entropy_rmpad.shape}, dtype: {entropy_rmpad.dtype}")
+                else:
+                    print(f"entropy_rmpad is None")
 
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
@@ -196,20 +205,20 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
                 logits.div_(temperature)
-                if rank == 0:
-                    print(f"logits.div_(temperature).shape: {logits.shape}, dtype: {logits.dtype}")
+                # if rank == 0:
+                #     print(f"logits.div_(temperature).shape: {logits.shape}, dtype: {logits.dtype}")
                 
                 logits = logits[:, -response_length - 1:-1, :]  # (bsz, response_length, vocab_size)
-                if rank == 0:
-                    print(f"logits.shape: {logits.shape}, dtype: {logits.dtype}")
+                # if rank == 0:
+                #     print(f"logits.shape: {logits.shape}, dtype: {logits.dtype}")
                 
                 log_probs = logprobs_from_logits(logits, micro_batch['responses'])
-                if rank == 0:
-                    print(f"log_probs.shape: {log_probs.shape}, dtype: {log_probs.dtype}")
+                # if rank == 0:
+                #     print(f"log_probs.shape: {log_probs.shape}, dtype: {log_probs.dtype}")
 
                 entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
-                if rank == 0:
-                    print(f"entropy.shape: {entropy.shape}, dtype: {entropy.dtype}")
+                # if rank == 0:
+                #     print(f"entropy.shape: {entropy.shape}, dtype: {entropy.dtype}")
             return entropy, log_probs
 
     def _optimizer_step(self):
@@ -319,9 +328,18 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
+        torch.cuda.memory._record_memory_history()
+        already_touched = 0
+        stop_at = 5
+
         metrics = {}
         for epoch in range(self.config.ppo_epochs):
+            if already_touched > stop_at:
+                break
             for batch_idx, data in enumerate(dataloader):
+                if already_touched > stop_at:
+                    break
+
                 # split batch into micro_batches
                 mini_batch = data
                 if has_multi_modal_inputs:
@@ -413,8 +431,23 @@ class DataParallelPPOActor(BasePPOActor):
                     }
                     append_to_dict(metrics, data)
 
+                    already_touched += 1
+                    print(f"already_touched: {already_touched}")
+                    if already_touched > stop_at:
+                        break
                 grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
             append_to_dict(metrics, data)
+
+        # Only the first rank will call the following code
+        rank = torch.distributed.get_rank()
+        print(f"rank: {rank}")
+        if rank == 0:
+            torch.cuda.memory._dump_snapshot("actor.pickle")
+        # Synchronize all processes in the distributed world
+        # This ensures all ranks have completed their work before proceeding
+        torch.distributed.barrier()
+
         self.actor_optimizer.zero_grad()
+        exit()
         return metrics

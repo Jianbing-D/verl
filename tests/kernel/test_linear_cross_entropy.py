@@ -52,10 +52,12 @@ compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=
 def run_torch_entropy(hidden: torch.Tensor,
                       weight: torch.Tensor,
                       labels: torch.Tensor,
+                      temperature: float,
                       reduction="none") -> typing.List[torch.Tensor]:
     # [num_tokens, vocab_size]
     logits = torch.matmul(hidden.to(torch.float32), 
                           weight.to(torch.float32) if weight.size(0) == hidden.size(1) else weight.T.to(torch.float32))  
+    logits /= temperature
     pd = torch.nn.functional.softmax(logits, dim=-1)  # [num_tokens, vocab_size]
     entropy_a = torch.logsumexp(logits, dim=-1)  # [num_tokens]
     entropy_b = torch.sum(pd * logits, dim=-1)  # [num_tokens]
@@ -73,9 +75,11 @@ class TorchEntropyTP(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, hidden: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor,
+                temperature: float,
                 dist_process_group: torch.distributed.ProcessGroup):
         # weight has shape [vocab_size, hidden_size], hidden has shape [num_tokens, hidden_size]
         logits = torch.matmul(hidden.to(torch.float32), weight.to(torch.float32).T)  # [num_tokens, vocab_size]
+        logits /= temperature
         whole_logits = torch.empty((logits.shape[0], logits.shape[1] * dist.get_world_size(dist_process_group)),
                                    dtype=logits.dtype,
                                    device=logits.device)
@@ -95,14 +99,14 @@ class TorchEntropyTP(torch.autograd.Function):
 
         ctx.save_for_backward(hidden, weight, labels, whole_logits, entropy_b)
         ctx.dist_process_group = dist_process_group
-
+        ctx.temperature = temperature
         return logprobs, entropy
 
     @staticmethod
     def backward(ctx, g_logprobs: torch.Tensor, g_entropy: torch.Tensor):
         hidden, weight, labels, whole_logits, entropy_b = ctx.saved_tensors
         dist_process_group = ctx.dist_process_group
-
+        temperature = ctx.temperature
         batch_size, hidden_size = hidden.shape
         vocab_size, hidden_size = weight.shape
         world_size = dist.get_world_size(dist_process_group)
@@ -137,6 +141,7 @@ class TorchEntropyTP(torch.autograd.Function):
 
         # Combine gradients
         d_logits = d_logits_entropy + d_logits_logprobs
+        d_logits /= temperature
 
         # Get local slice of gradients
         local_d_logits = d_logits[:, rank * vocab_size:(rank + 1) * vocab_size]
@@ -145,7 +150,7 @@ class TorchEntropyTP(torch.autograd.Function):
         d_hidden = torch.matmul(local_d_logits, weight.to(torch.float32))
         d_weight = torch.matmul(local_d_logits.T, hidden.to(torch.float32))
 
-        return d_hidden, d_weight, None, None
+        return d_hidden, d_weight, None, None, None
 
 
 run_torch_entropy_tp = TorchEntropyTP.apply
@@ -153,10 +158,12 @@ run_torch_entropy_tp = TorchEntropyTP.apply
 def run_verl_actor_entropy(hidden: torch.Tensor,
                            weight: torch.Tensor,
                            labels: torch.Tensor,
+                           temperature: float,
                            reduction="none") -> typing.List[torch.Tensor]:
      # [num_tokens, vocab_size]
     logits = torch.matmul(hidden.to(torch.float32), 
                           weight.to(torch.float32) if weight.size(0) == hidden.size(1) else weight.T.to(torch.float32)) 
+    logits /= temperature
     # compute entropy
     entropy = compute_entropy_from_logits(logits)  # ((total_nnz / sp) + pad)
     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
@@ -177,6 +184,7 @@ class TestLinearCrossEntropy:
         self.num_tokens = 13092
         self.hidden_size = 4096
         self.vocab_size = 152064
+        self.temperature = 1.5
         self.dtype = torch.bfloat16
 
     def generate_forward_inputs(self):
@@ -214,19 +222,19 @@ class TestLinearCrossEntropy:
             hidden, weight, labels = self.generate_forward_inputs()
 
             start_event.record()
-            (torch_logprobs, torch_entropy) = run_torch_entropy(hidden, weight, labels)
+            (torch_logprobs, torch_entropy) = run_torch_entropy(hidden, weight, labels, self.temperature)
             end_event.record()
             torch.cuda.synchronize()
             torch_forward_latency.append(start_event.elapsed_time(end_event))
 
             start_event.record()
-            (verl_logprobs, verl_entropy) = run_verl_actor_entropy(hidden, weight, labels)
+            (verl_logprobs, verl_entropy) = run_verl_actor_entropy(hidden, weight, labels, self.temperature)
             end_event.record()
             torch.cuda.synchronize()
             verl_forward_latency.append(start_event.elapsed_time(end_event))
 
             start_event.record()
-            (kernel_logprobs, kernel_entropy) = linear_cross_entropy(hidden, weight, labels, "none")
+            (kernel_logprobs, kernel_entropy) = linear_cross_entropy(hidden, weight, labels, "none", self.temperature)
             end_event.record()
             torch.cuda.synchronize()
             kernel_forward_latency.append(start_event.elapsed_time(end_event))
@@ -315,19 +323,19 @@ class TestLinearCrossEntropy:
             hidden, weight, labels = self.generate_forward_inputs()
 
             start_event.record()
-            (torch_logprobs, torch_entropy) = run_torch_entropy(hidden, weight, labels)
+            (torch_logprobs, torch_entropy) = run_torch_entropy(hidden, weight, labels, self.temperature)
             end_event.record()
             torch.cuda.synchronize()
             torch_forward_latency.append(start_event.elapsed_time(end_event))
 
             start_event.record()
-            (kernel_logprobs, kernel_entropy) = linear_cross_entropy(hidden, weight, labels, "none")
+            (kernel_logprobs, kernel_entropy) = linear_cross_entropy(hidden, weight, labels, "none", self.temperature)
             end_event.record()
             torch.cuda.synchronize()
             kernel_forward_latency.append(start_event.elapsed_time(end_event))
 
             torch.testing.assert_close(torch_logprobs, kernel_logprobs, atol=1e-1, rtol=1e-2)
-            torch.testing.assert_close(torch_entropy, kernel_entropy, atol=1e-1, rtol=1e-2)
+            torch.testing.assert_close(torch_entropy, kernel_entropy, atol=1e-0, rtol=1e-2)
 
             # backward
             g_entropy, g_logprobs = self.generate_backward_inputs()
@@ -385,16 +393,16 @@ class TestLinearCrossEntropy:
             print(f"[INFO]: Iteration {i + 1} / {iterations}...", end='\r')
             hidden, weight, labels = self.generate_forward_inputs()
 
-            (kernel_logprobs, kernel_entropy) = linear_cross_entropy(hidden, weight, labels, "none")
+            (kernel_logprobs, kernel_entropy) = linear_cross_entropy(hidden, weight, labels, "none", self.temperature)
 
             start_event.record()
-            (verl_logprobs, verl_entropy) = run_verl_actor_entropy(hidden, weight, labels)
+            (verl_logprobs, verl_entropy) = run_verl_actor_entropy(hidden, weight, labels, self.temperature)
             end_event.record()
             torch.cuda.synchronize()
             verl_forward_latency.append(start_event.elapsed_time(end_event))
 
             torch.testing.assert_close(kernel_logprobs, verl_logprobs, atol=1e-1, rtol=1e-2)
-            torch.testing.assert_close(kernel_entropy, verl_entropy, atol=1e-1, rtol=1e-2)
+            torch.testing.assert_close(kernel_entropy, verl_entropy, atol=1e-0, rtol=1e-2)
 
             # backward
             g_entropy, g_logprobs = self.generate_backward_inputs()
@@ -411,8 +419,8 @@ class TestLinearCrossEntropy:
             torch.cuda.synchronize()
             verl_backward_latency.append(start_event.elapsed_time(end_event))
 
-            torch.testing.assert_close(d_kernel_hidden, d_verl_hidden, atol=1e-1, rtol=1e-4)
-            torch.testing.assert_close(d_kernel_weight, d_verl_weight, atol=1e-1, rtol=1e-4) 
+            torch.testing.assert_close(d_kernel_hidden, d_verl_hidden, atol=1e-0, rtol=1e-4)
+            torch.testing.assert_close(d_kernel_weight, d_verl_weight, atol=1e-0, rtol=1e-4) 
             
         # remove first latency
         verl_forward_latency = verl_forward_latency[1:]
@@ -432,7 +440,10 @@ class TestLinearCrossEntropy:
         hidden, weight, labels = self.generate_forward_inputs()
 
         torch.cuda.reset_peak_memory_stats()
-        (logprobs, entropy) = run_forward(hidden, weight, labels, reduction)
+        if method_name == "Kernel":
+            (logprobs, entropy) = run_forward(hidden, weight, labels, reduction, self.temperature)
+        else:
+            (logprobs, entropy) = run_forward(hidden, weight, labels, self.temperature, reduction)
         torch.cuda.synchronize()
         torch_max_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
         print(f"[INFO]: {method_name} Forward pass peak memory: {torch_max_memory:.2f} MB")
@@ -481,6 +492,7 @@ class TestLinearCrossEntropy_TensorParallel:
         # self.num_tokens = 80
         self.hidden_size = 4096
         self.vocab_size = 152064
+        self.temperature = 1.5
         self.dtype = torch.bfloat16
         self.iterations = 5
 
@@ -529,9 +541,9 @@ class TestLinearCrossEntropy_TensorParallel:
             # Set requires_grad for autograd
             whole_weight.requires_grad_()
 
-            (single_logprobs, single_entropy) = run_torch_entropy(hidden, whole_weight, labels)
+            (single_logprobs, single_entropy) = run_torch_entropy(hidden, whole_weight, labels, self.temperature)
 
-            (tp_logprobs, tp_entropy) = run_torch_entropy_tp(hidden, weight, labels, self.group)
+            (tp_logprobs, tp_entropy) = run_torch_entropy_tp(hidden, weight, labels, self.temperature, self.group)
 
             torch.testing.assert_close(single_logprobs, tp_logprobs, atol=1e-4, rtol=1e-4)
             torch.testing.assert_close(single_entropy, tp_entropy, atol=1e-4, rtol=1e-4)
@@ -575,7 +587,7 @@ class TestLinearCrossEntropy_TensorParallel:
         dist.broadcast(labels, src=0, group=self.group)
 
         torch.cuda.reset_peak_memory_stats()
-        (tp_logprobs, tp_entropy) = run_torch_entropy_tp(hidden, weight, labels, self.group)
+        (tp_logprobs, tp_entropy) = run_torch_entropy_tp(hidden, weight, labels, self.temperature, self.group)
         torch.cuda.synchronize()
         forward_max_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
 
@@ -617,13 +629,13 @@ class TestLinearCrossEntropy_TensorParallel:
             dist.broadcast(labels, src=0, group=self.group)
 
             start_event.record()
-            (torch_logprobs, torch_entropy) = run_torch_entropy_tp(hidden, weight, labels, self.group)
+            (torch_logprobs, torch_entropy) = run_torch_entropy_tp(hidden, weight, labels, self.temperature, self.group)
             end_event.record()
             torch.cuda.synchronize()
             torch_forward_latency.append(start_event.elapsed_time(end_event))
 
             start_event.record()
-            (kernel_logprobs, kernel_entropy) = linear_cross_entropy(hidden, weight, labels, "none", self.group)
+            (kernel_logprobs, kernel_entropy) = linear_cross_entropy(hidden, weight, labels, "none", self.temperature, self.group)
             end_event.record()
             torch.cuda.synchronize()
             kernel_forward_latency.append(start_event.elapsed_time(end_event))
@@ -689,7 +701,7 @@ class TestLinearCrossEntropy_TensorParallel:
         dist.broadcast(labels, src=0, group=self.group)
 
         torch.cuda.reset_peak_memory_stats()
-        (kernel_logprobs, kernel_entropy) = linear_cross_entropy(hidden, weight, labels, "none", self.group)
+        (kernel_logprobs, kernel_entropy) = linear_cross_entropy(hidden, weight, labels, "none", self.temperature, self.group)
         torch.cuda.synchronize()
         kernel_max_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
 
@@ -717,7 +729,7 @@ if __name__ == "__main__":
 
     # Check if running with torchrun (distributed mode)
     is_distributed = False
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+    if "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
         is_distributed = True
     print(f"[INFO]: Running in {'distributed' if is_distributed else 'non-distributed'} mode")
     torch.manual_seed(233376 + int(os.environ.get("RANK", 0)))

@@ -132,22 +132,23 @@ def efficient_entropy_kernel_general_mainloop(
         hidden_size,
         vocab_size,
         vocab_per_split,
-        stride_hidden_m,
-        stride_hidden_k,
-        stride_weight_n,
-        stride_weight_k,
+        stride_hidden_m: tl.int64,
+        stride_hidden_k: tl.int64,
+        stride_weight_n: tl.int64,
+        stride_weight_k: tl.int64,
         max_ptr,
-        stride_max_m,
-        stride_max_n,
+        stride_max_m: tl.int64,
+        stride_max_n: tl.int64,
         accu_ptr,
-        stride_accu_m,
-        stride_accu_n,
+        stride_accu_m: tl.int64,
+        stride_accu_n: tl.int64,
         entropy_b_ptr,
-        stride_entropy_b_m,
-        stride_entropy_b_n,
+        stride_entropy_b_m: tl.int64,
+        stride_entropy_b_n: tl.int64,
         global_logprobs_ptr,
-        stride_global_logprobs,
+        stride_global_logprobs: tl.int64,
         global_logprobs_scalar_ptr,
+        rcp_temperature: tl.float32,
         # Meta-parameters
         BLOCK_SIZE_M: tl.constexpr,
         BLOCK_SIZE_N: tl.constexpr,
@@ -210,6 +211,9 @@ def efficient_entropy_kernel_general_mainloop(
         # reset hidden_ptrs for next iteration
         hidden_ptrs -= hidden_size * stride_hidden_k
 
+        # scale logits by temperature
+        logits *= rcp_temperature
+
         # update global maximum
         _max_old = _max
         m_pid_n = tl.max(logits, axis=1)
@@ -248,12 +252,12 @@ def efficient_entropy_kernel_general_mainloop(
 
 @triton.autotune(configs=[triton.Config({"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64})], key=["num_tokens", "num_splits"])
 @triton.jit
-def efficient_entropy_triton_kernel_epilogue(max_ptr, stride_max_m, stride_max_n, num_tokens, num_splits,
-                                             global_max_ptr, stride_global_max, accu_ptr, stride_accu_m, stride_accu_n,
-                                             global_accu_ptr, stride_global_accu, entropy_b_ptr, stride_entropy_b_m,
-                                             stride_entropy_b_n, global_entropy_b_ptr, stride_global_entropy_b,
-                                             global_entropy_ptr, stride_global_entropy, global_logprobs_ptr,
-                                             stride_global_logprobs, global_logprobs_scalar_ptr, reduction: int,
+def efficient_entropy_triton_kernel_epilogue(max_ptr, stride_max_m: tl.int64, stride_max_n: tl.int64, num_tokens, num_splits,
+                                             global_max_ptr, stride_global_max: tl.int64, accu_ptr, stride_accu_m: tl.int64, stride_accu_n: tl.int64,
+                                             global_accu_ptr, stride_global_accu: tl.int64, entropy_b_ptr, stride_entropy_b_m: tl.int64,
+                                             stride_entropy_b_n: tl.int64, global_entropy_b_ptr, stride_global_entropy_b: tl.int64,
+                                             global_entropy_ptr, stride_global_entropy: tl.int64, global_logprobs_ptr,
+                                             stride_global_logprobs: tl.int64, global_logprobs_scalar_ptr, reduction: int,
                                              BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
     """
     foward epilogue
@@ -321,10 +325,10 @@ def efficient_entropy_triton_kernel_epilogue(max_ptr, stride_max_m, stride_max_n
 @triton.autotune(configs=[triton.Config({"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64})], key=["num_tokens", "num_splits"])
 @triton.jit
 def efficient_entropy_triton_kernel_epilogue_tp(
-        num_tokens, num_splits, reduced_max_ptr, stride_reduced_max_m, stride_reduced_max_n, original_max_ptr,
-        stride_original_max_m, stride_original_max_n, accu_ptr, stride_accu_m, stride_accu_n, entropy_b_ptr,
-        stride_entropy_b_m, stride_entropy_b_n, global_max_ptr, stride_global_max, global_accu_ptr, stride_global_accu,
-        global_entropy_b_ptr, stride_global_entropy_b, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+        num_tokens, num_splits, reduced_max_ptr, stride_reduced_max_m: tl.int64, stride_reduced_max_n: tl.int64, original_max_ptr,
+        stride_original_max_m: tl.int64, stride_original_max_n: tl.int64, accu_ptr, stride_accu_m: tl.int64, stride_accu_n: tl.int64, entropy_b_ptr,
+        stride_entropy_b_m: tl.int64, stride_entropy_b_n: tl.int64, global_max_ptr, stride_global_max: tl.int64, global_accu_ptr, stride_global_accu: tl.int64,
+        global_entropy_b_ptr, stride_global_entropy_b: tl.int64, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
     pid_m = tl.program_id(axis=0)
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -372,9 +376,9 @@ def efficient_entropy_triton_kernel_epilogue_tp(
 
 @triton.autotune(configs=[triton.Config({"BLOCK_SIZE_M": 16})], key=["num_tokens"])
 @triton.jit
-def efficient_entropy_triton_epilogue_tp_update(num_tokens, logprobs_ptr, stride_logprobs, maximum_ptr, stride_maximum,
-                                                accumulate_ptr, stride_accumulate, entropy_b_ptr, stride_entropy_b,
-                                                entropy_ptr, stride_entropy, logprobs_scalar_ptr, reduction: int,
+def efficient_entropy_triton_epilogue_tp_update(num_tokens, logprobs_ptr, stride_logprobs: tl.int64, maximum_ptr, stride_maximum: tl.int64,
+                                                accumulate_ptr, stride_accumulate: tl.int64, entropy_b_ptr, stride_entropy_b: tl.int64,
+                                                entropy_ptr, stride_entropy: tl.int64, logprobs_scalar_ptr, reduction: int,
                                                 BLOCK_SIZE_M: tl.constexpr):
     pid_m = tl.program_id(axis=0)
 
@@ -412,6 +416,7 @@ def efficient_entropy_forward(
         weight: torch.Tensor,
         labels: torch.Tensor,
         reduction: typing.Optional[int] = 2,
+        temperature: typing.Optional[float] = 1.0,
         dist_process_group: typing.Optional[dist.ProcessGroup] = None) -> typing.List[torch.Tensor]:
     """
     forward host function
@@ -486,8 +491,9 @@ def efficient_entropy_forward(
                                                                 _max.stride(0), _max.stride(1), _accu, _accu.stride(0),
                                                                 _accu.stride(1), _entropy_b, _entropy_b.stride(0),
                                                                 _entropy_b.stride(1), _logprobs, _logprobs.stride(0),
-                                                                logprobs)
+                                                                logprobs, 1.0 / temperature)
     else:
+        assert temperature == 1.0, "temperature has not been supported yet"
         lce_ext.forward_mainloop(hidden, hidden.stride(0), hidden.stride(1),
                                 weight, weight.stride(0), weight.stride(1),
                                 labels, labels.stride(0),
@@ -558,11 +564,11 @@ def efficient_entropy_forward(
 )
 @triton.jit
 def efficient_entropy_backward_kernel_general_mainloop_MN(
-        num_tokens: int, hidden_size: int, vocab_size: int, rank: int, hidden_ptr, stride_hidden_m, stride_hidden_k,
-        weight_ptr, stride_weight_n, stride_weight_k, labels_ptr, stride_labels, maximum_ptr, stride_maximum, accu_ptr,
-        stride_accu, d_entropy_ptr, stride_d_entropy, d_logprobs_ptr, stride_d_logprobs, reduction: int, entropy_b_ptr,
-        stride_entropy_b, d_hidden_ptr, stride_d_hidden_m, stride_d_hidden_k, d_weight_ptr, stride_d_weight_n,
-        stride_d_weight_k, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+        num_tokens: int, hidden_size: int, vocab_size: int, rank: int, hidden_ptr, stride_hidden_m: tl.int64, stride_hidden_k: tl.int64,
+        weight_ptr, stride_weight_n: tl.int64, stride_weight_k: tl.int64, labels_ptr, stride_labels: tl.int64, maximum_ptr, stride_maximum: tl.int64, accu_ptr,
+        stride_accu: tl.int64, d_entropy_ptr, stride_d_entropy: tl.int64, d_logprobs_ptr, stride_d_logprobs: tl.int64, reduction: int, entropy_b_ptr,
+        stride_entropy_b: tl.int64, d_hidden_ptr, stride_d_hidden_m: tl.int64, stride_d_hidden_k: tl.int64, d_weight_ptr, stride_d_weight_n: tl.int64,
+        stride_d_weight_k: tl.int64, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
         GROUP_SIZE_M: tl.constexpr):
     """
     backward mainloop, where d_logits & d_hidden & d_weight are fused
@@ -692,11 +698,11 @@ def efficient_entropy_backward_kernel_general_mainloop_MN(
 )
 @triton.jit
 def efficient_entropy_backward_kernel_general_d_logits(
-        num_tokens: int, hidden_size: int, vocab_size: int, rank: int, hidden_ptr, stride_hidden_m, stride_hidden_k,
-        weight_ptr, stride_weight_n, stride_weight_k, labels_ptr, stride_labels, maximum_ptr, stride_maximum, accu_ptr,
-        stride_accu, d_entropy_ptr, stride_d_entropy, d_logprobs_ptr, stride_d_logprobs, reduction: int, entropy_b_ptr,
-        stride_entropy_b, d_logits_ptr, stride_d_logits_m, stride_d_logits_n, BLOCK_SIZE_M: tl.constexpr,
-        BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+        num_tokens: int, hidden_size: int, vocab_size: int, rank: int, hidden_ptr, stride_hidden_m: tl.int64, stride_hidden_k: tl.int64,
+        weight_ptr, stride_weight_n: tl.int64, stride_weight_k: tl.int64, labels_ptr, stride_labels: tl.int64, maximum_ptr, stride_maximum: tl.int64, accu_ptr,
+        stride_accu: tl.int64, d_entropy_ptr, stride_d_entropy: tl.int64, d_logprobs_ptr, stride_d_logprobs: tl.int64, reduction: int, entropy_b_ptr,
+        stride_entropy_b, d_logits_ptr, stride_d_logits_m: tl.int64, stride_d_logits_n: tl.int64, rcp_temperature: tl.float32,
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
     """
     backward d_logits
     """
@@ -767,16 +773,22 @@ def efficient_entropy_backward_kernel_general_d_logits(
     hidden_ptrs -= hidden_size * stride_hidden_k
     weight_ptrs -= hidden_size * stride_weight_k
 
+    # scale logits by temperature
+    logits *= rcp_temperature
+
     exp_logits = tl.exp(logits - maximum[:, None])
 
     mask = (offs_bn + rank * vocab_size)[None, :] == labels[:, None]
     d_logits = d_logprobs[:, None] * (exp_logits * accu_rcp[:, None] - mask)
     d_logits += d_entropy[:, None] * (-exp_logits * accu_rcp[:, None]) * (logits - entropy_b[:, None])
 
+    # scale d_logits by temperature
+    d_logits *= rcp_temperature
+
     # store d_logits
     d_logits_ptrs = d_logits_ptr + offs_am[:, None] * stride_d_logits_m + offs_bn[None, :] * stride_d_logits_n
     tl.store(d_logits_ptrs,
-             d_logits.to(hidden_ptr.dtype.element_ty),
+             d_logits, # will be implicitly converted to d_logits_ptrs.dtype.element_ty
              mask=(offs_am[:, None] < num_tokens) & (offs_bn[None, :] < vocab_size))
 
 
@@ -791,6 +803,7 @@ def efficient_entropy_backward(
         entropy_b: torch.Tensor,
         reduction: typing.Optional[int] = 2,
         should_return_fp32_grad: bool = False,
+        temperature: typing.Optional[float] = 1.0,
         dist_process_group: typing.Optional[dist.ProcessGroup] = None) -> typing.List[torch.Tensor]:
     """
     backward host function
@@ -846,6 +859,8 @@ def efficient_entropy_backward(
     if _config._backward == BackwardEnum._Total_Fuse_MN:
         def mainloop_grid(meta):
             return (triton.cdiv(num_tokens, meta["BLOCK_SIZE_M"]) * triton.cdiv(vocab_size, meta["BLOCK_SIZE_N"]),)
+
+        assert temperature == 1.0, "temperature has not been supported yet"
 
         efficient_entropy_backward_kernel_general_mainloop_MN[mainloop_grid](
             num_tokens,
@@ -913,20 +928,21 @@ def efficient_entropy_backward(
                 _d_logits,
                 _d_logits.stride(0),
                 _d_logits.stride(1),
+                1.0 / temperature,
             )
-
-            # _d_logits_t = _d_logits.T.contiguous()
-            # torch.matmul(_d_logits, weight, out=d_hidden)
-            # torch.matmul(_d_logits_t, hidden, out=d_weight)
-            lce_ext.cublas_matmul_after_d_logits(
-                num_tokens, hidden_size, vocab_size, _rank,
-                hidden, hidden.stride(0), hidden.stride(1),
-                weight, weight.stride(0), weight.stride(1),
-                _d_logits, _d_logits.stride(0), _d_logits.stride(1),
-                d_hidden, d_hidden.stride(0), d_hidden.stride(1),
-                d_weight, d_weight.stride(0), d_weight.stride(1),
-            )
+      
+            torch.matmul(_d_logits, weight, out=d_hidden)
+            torch.matmul(_d_logits.T, hidden, out=d_weight)
+            # lce_ext.cublas_matmul_after_d_logits(
+            #     num_tokens, hidden_size, vocab_size, _rank,
+            #     hidden, hidden.stride(0), hidden.stride(1),
+            #     weight, weight.stride(0), weight.stride(1),
+            #     _d_logits, _d_logits.stride(0), _d_logits.stride(1),
+            #     d_hidden, d_hidden.stride(0), d_hidden.stride(1),
+            #     d_weight, d_weight.stride(0), d_weight.stride(1),
+            # )
         else:
+            assert temperature == 1.0, "temperature has not been supported yet"
             # lce_ext.backward_d_logits(
             #     num_tokens, hidden_size, vocab_size, _rank,
             #     hidden, hidden.stride(0), hidden.stride(1),

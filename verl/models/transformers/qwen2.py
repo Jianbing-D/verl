@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Union, List
 
 import torch
 from transformers.cache_utils import Cache
@@ -28,6 +28,16 @@ from verl.utils.ulysses import (
 )
 
 logger = logging.get_logger(__name__)
+
+from verl.utils.kernel import linear_cross_entropy, set_backward_method, BackwardEnum
+
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from dataclasses import dataclass
+
+@dataclass
+class FusedCausalLMOutputWithPast(CausalLMOutputWithPast):
+    log_probs: Optional[torch.Tensor] = None
+    entropy: Optional[torch.Tensor] = None
 
 
 def qwen2_flash_attn_forward(
@@ -303,7 +313,8 @@ def qwen2_fused_forward(
         hidden_states_view = hidden_states.view(-1, hidden_states.size(-1))
         weight_view = self.lm_head.weight
         # set_backward_method(BackwardEnum._Total_Fuse_MN)
-        log_probs, entropy = linear_cross_entropy(hidden_states_view, weight_view, labels, "none")
+        log_probs, entropy = linear_cross_entropy(hidden_states_view, weight_view, labels, "none",
+                                                  (1.0 if temperature is None else 1.0 / temperature))
     else:
         # Inferencce mode
         logits = self.lm_head(hidden_states)
@@ -314,6 +325,9 @@ def qwen2_fused_forward(
     if not return_dict:
         output = (logits,) + outputs[1:]
         return ((loss,) + output) if loss is not None else output
+
+    print(f"hidden_states.shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+    print(f"weight.shape: {self.lm_head.weight.shape}, dtype: {self.lm_head.weight.dtype}")
 
     return FusedCausalLMOutputWithPast(
         loss=loss,
