@@ -44,12 +44,12 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.n=5 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fuse_entropy_logprobs=True \
-    actor_rollout_ref.ref.fuse_entropy_logprobs=False \
+    actor_rollout_ref.ref.fuse_entropy_logprobs=True \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
-    trainer.logger=['console'] \
+    trainer.logger=['console','wandb'] \
     trainer.project_name='verl_grpo_example_gsm8k' \
-    trainer.experiment_name='qwen2_7b_seq_balance_main_24000' \
+    trainer.experiment_name='qwen2_7b_seq_balance_main_actor_ref_24000' \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \

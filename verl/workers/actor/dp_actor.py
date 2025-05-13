@@ -167,12 +167,6 @@ class DataParallelPPOActor(BasePPOActor):
                     if calculate_entropy:
                         entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
 
-                print(f"log_probs.shape: {log_probs.shape}, dtype: {log_probs.dtype}")
-                if calculate_entropy:
-                    print(f"entropy_rmpad.shape: {entropy_rmpad.shape}, dtype: {entropy_rmpad.dtype}")
-                else:
-                    print(f"entropy_rmpad is None")
-
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
                     # gather and unpad for the ulysses sp
@@ -328,17 +322,17 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
-        torch.cuda.memory._record_memory_history()
-        already_touched = 0
-        stop_at = 5
+        # torch.cuda.memory._record_memory_history()
+        # already_touched = 0
+        # stop_at = 5
 
         metrics = {}
         for epoch in range(self.config.ppo_epochs):
-            if already_touched > stop_at:
-                break
+            # if already_touched > stop_at:
+            #     break
             for batch_idx, data in enumerate(dataloader):
-                if already_touched > stop_at:
-                    break
+                # if already_touched > stop_at:
+                #     break
 
                 # split batch into micro_batches
                 mini_batch = data
@@ -431,23 +425,23 @@ class DataParallelPPOActor(BasePPOActor):
                     }
                     append_to_dict(metrics, data)
 
-                    already_touched += 1
-                    print(f"already_touched: {already_touched}")
-                    if already_touched > stop_at:
-                        break
+                    # already_touched += 1
+                    # print(f"already_touched: {already_touched}")
+                    # if already_touched > stop_at:
+                    #     break
                 grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
             append_to_dict(metrics, data)
 
-        # Only the first rank will call the following code
-        rank = torch.distributed.get_rank()
-        print(f"rank: {rank}")
-        if rank == 0:
-            torch.cuda.memory._dump_snapshot("actor.pickle")
-        # Synchronize all processes in the distributed world
-        # This ensures all ranks have completed their work before proceeding
-        torch.distributed.barrier()
+        # # Only the first rank will call the following code
+        # rank = torch.distributed.get_rank()
+        # print(f"rank: {rank}")
+        # if rank == 0:
+        #     torch.cuda.memory._dump_snapshot("update_actor.pickle")
+        # # Synchronize all processes in the distributed world
+        # # This ensures all ranks have completed their work before proceeding
+        # torch.distributed.barrier()
+        # exit()
 
         self.actor_optimizer.zero_grad()
-        exit()
         return metrics

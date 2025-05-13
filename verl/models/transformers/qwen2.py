@@ -312,7 +312,7 @@ def qwen2_fused_forward(
         # print(f"labels: {labels.shape, labels.dim()}")
         hidden_states_view = hidden_states.view(-1, hidden_states.size(-1))
         weight_view = self.lm_head.weight
-        # set_backward_method(BackwardEnum._Total_Fuse_MN)
+        set_backward_method(BackwardEnum._Split_Dlogits_N)
         log_probs, entropy = linear_cross_entropy(hidden_states_view, weight_view, labels, "none",
                                                   (1.0 if temperature is None else 1.0 / temperature))
     else:
@@ -325,9 +325,6 @@ def qwen2_fused_forward(
     if not return_dict:
         output = (logits,) + outputs[1:]
         return ((loss,) + output) if loss is not None else output
-
-    print(f"hidden_states.shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
-    print(f"weight.shape: {self.lm_head.weight.shape}, dtype: {self.lm_head.weight.dtype}")
 
     return FusedCausalLMOutputWithPast(
         loss=loss,
