@@ -8,7 +8,7 @@ math_test_path=$HOME/data/math/test.parquet
 train_files="['$gsm8k_train_path', '$math_train_path']"
 test_files="['$gsm8k_test_path', '$math_test_path']"
 
-USE_FUSED_KERNEL=False
+USE_FUSED_KERNEL=True
 # FUSED_KERNEL_BACKEND=triton # or 'torch' for torch backend
 FUSED_KERNEL_BACKEND=torch
 
@@ -57,7 +57,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl_example_gsm8k' \
-    trainer.experiment_name='qwen2-7b_hybrid_no_fuse' \
+    trainer.experiment_name='qwen2-7b_hybrid_fuse_torch' \
     trainer.n_gpus_per_node=8 \
     trainer.val_before_train=False \
     trainer.nnodes=1 \
